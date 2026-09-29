@@ -1,0 +1,5 @@
+# State and logs from runs that set state_dir inside the checkout
+/state/
+# Editor and system leftovers
+*.swp
+.DS_Store

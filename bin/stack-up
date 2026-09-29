@@ -1,0 +1,4120 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+# stack-up - brings a local development stack up from one config file, stage by
+# stage, and stops the processes it launched, plus its compose services.
+# Reference design: docs/ARCHITECTURE.md. Runs on stock macOS bash 3.2.
+# Exit status: 0 open, stopped or done, 1 partial or stopped early, 2 usage,
+# invalid config or unusable environment, 3 degraded, 4 busy, 129, 130 and 143
+# on HUP, INT and TERM.
+# It never runs sudo or eval itself (what the commands in a config do is
+# theirs), never picks a process to signal by name or pattern, and never asks
+# compose to remove a container or volume. The only process groups it signals
+# are its own launches: a recorded group while a process in it still holds the
+# launch token, a launch of a moment ago or a --check probe while the kernel
+# still reports it. tests/unit-static.sh and tests/unit-compose.sh gate these.
+
+set -u
+set -o pipefail
+set -o noclobber
+# Run as sh, or with POSIXLY_CORRECT exported, bash starts in POSIX mode, where
+# the process substitution that reads provider output is a syntax error.
+set +o posix
+# An exported CDPATH makes cd print the folder it found, which would end up in
+# every $(cd ... && pwd -P) below.
+unset CDPATH
+
+su_resolve_home() {
+  local path=$1 link dir
+  while [ -L "$path" ]; do
+    link=$(readlink "$path") || return 1
+    case $link in
+      /*) path=$link ;;
+      *) path=${path%/*}/$link ;;
+    esac
+  done
+  case $path in
+    */*) dir=${path%/*} ;;
+    *) dir=. ;;
+  esac
+  SU_HOME=$(cd -- "$dir/.." && pwd -P) || return 1
+  SU_ENGINE_FILE=$(cd -- "$dir" && pwd -P)/${path##*/} || return 1
+  return 0
+}
+
+su_resolve_home "${BASH_SOURCE[0]}" || { printf 'stack-up: cannot find its own folder\n' >&2; exit 2; }
+# shellcheck source=../lib/term.sh
+. "$SU_HOME/lib/term.sh" || exit 2
+# shellcheck source=../lib/lifecycle.sh
+. "$SU_HOME/lib/lifecycle.sh" || exit 2
+# shellcheck source=../lib/prompt.sh
+. "$SU_HOME/lib/prompt.sh" || exit 2
+# shellcheck source=../lib/conf.sh
+. "$SU_HOME/lib/conf.sh" || exit 2
+# shellcheck source=../lib/classify.sh
+. "$SU_HOME/lib/classify.sh" || exit 2
+
+SU_VERSION=unknown
+if [ -r "$SU_HOME/VERSION" ]; then
+  read -r SU_VERSION < "$SU_HOME/VERSION" || SU_VERSION=unknown
+fi
+
+SU_NAME_ERE='[a-z0-9][a-z0-9-]{0,39}'
+SU_ID_ERE='[a-z0-9][a-z0-9._-]{0,39}'
+SU_DEFAULT_STAGES='prepare infra data build migrate services web verify'
+SU_BUILTIN_OWNERS='this-machine local-config local-data upstream needs-a-look'
+SU_NL=$'\n'
+SU_TAB=$'\t'
+SU_SELF=stack-up
+SU_COMPOSE_FILES=()
+
+# One table drives --help, and tests/docs-cli.sh checks it against the parser's
+# case labels and the README's flag table, so a flag can neither be documented
+# without existing nor exist undocumented.
+su_flag_table() {
+  cat <<'EOF'
+--config FILE|the config file (default: ./stack.conf)
+--root DIR|base folder for relative paths; overrides [stack] root (a run given --root needs the same --root on --stop, --clean and --print-paths)
+--plan|print what would run, in order, then exit; writes nothing
+--dry-run|same as --plan
+--check|run the [check] probes without repairing, then exit
+--stop|stop the process groups this stack recorded, and ask compose to stop its [compose] services
+--clean|delete this stack's rotated launch tables, unused launch tokens and, with keep_runs above 0, older run logs (asks first)
+--print-config|print the parsed config as kind|name|key|value rows
+--print-schema|print every config key with its type and default
+--print-paths|print where this stack keeps state, and cleanup commands to run by hand
+--select SPEC|pick entries without a menu: essential, recommended, all, none, numbers such as 2 or 1-3, names, group:NAME
+--with OPTION|turn an [option] on without asking (repeatable)
+--without OPTION|turn an [option] off without asking (repeatable)
+--yes|ask nothing: every question takes its default, and --clean proceeds
+--no-repair|report unmet checks without repairing them
+--version|print the version
+-h, --help|print this help
+EOF
+}
+
+su_usage() {
+  local spec text
+  printf 'stack-up %s - bring a local stack up from one config file, stop what it launched, plus its compose services\n\n' "$SU_VERSION"
+  printf 'Usage: stack-up [--config FILE] [flags]\n\n'
+  while IFS='|' read -r spec text; do
+    printf '  %-22s %s\n' "$spec" "$text"
+  done <<EOF
+$(su_flag_table)
+EOF
+  printf '\nExit status: 0 open, stopped or another mode done, 1 partial, stopped early,\n'
+  printf 'left running, a required check unmet or not checked, a --plan port clash,\n'
+  printf 'or --clean declined or incomplete, 2 usage, invalid config or an unusable\n'
+  printf 'environment, 3 degraded, 4 another run holds the lock, 129 130 143 interrupted\n'
+  printf 'by HUP, INT or TERM.\n'
+}
+
+su_usage_error() {
+  printf 'stack-up: %s\n' "$1" >&2
+  printf 'Run %s --help for the flags.\n' "$SU_SELF" >&2
+  exit 2
+}
+
+# Schema rows: kind|key|type|flags|shown type|default|meaning. Kind "entry" is
+# declared for service, job, compose and env. The shown type and the default
+# are documentation, printed by --print-schema, which tests/docs-cli.sh checks
+# docs/CONFIG.md against.
+su_schema_rows() {
+  cat <<'EOF'
+stack|name|name|required|id|none, required|project id; names the default state folder and the compose project; give each stack on a machine its own name
+stack|title|text|-|text|the name in capitals|first banner line
+stack|subtitle|text|-|text|empty|second banner line
+stack|root|text|-|path|the config file's folder|STACK_ROOT, the base for relative paths
+stack|stages|names|-|id list|prepare infra data build migrate services web verify|stages in run order, each named once; each heading reads N/M name
+stack|parallel_stages|names|-|id list|empty|stages that launch every service first, then wait for each; a service whose dependency is a service of the same stage is launched once that one is ready
+stack|menus|names|-|group list|one menu of every pickable entry|one interactive picker per group; an entry in no listed group is offered in none
+stack|default_select|line|-|selection|essential|the selection when nobody is at a terminal or every menu is answered blank; a blank answer to one of several menus takes that menu's entries from it
+stack|require|command|repeat|command|empty|a command every run needs, checked with command -v
+stack|state_dir|text|-|path|${XDG_STATE_HOME:-$HOME/.local/state}/stack-up/NAME|history, lock, launch table, backups and repair log; when set, never the root, HOME or a folder above either; a relative XDG_STATE_HOME or HOME is ignored; the path cannot contain a vertical bar
+stack|log_dir|text|-|path|STATE_DIR/logs|run logs and entry logs; give it a folder of its own, because each entry log in it is truncated on every start; never the root, HOME or a folder above either
+stack|keep_runs|int|-|count|0|--clean keeps its own run log and the newest N before it; 0 keeps them all
+stack|compose_files|text|-|path list|empty|a space-separated list, so a space written in a path splits it (a space in the root or in a placeholder's value does not); no *, ? or [; each file is passed with -f on every compose call, which runs in STACK_ROOT; exported as STACK_COMPOSE
+stack|compose_command|command|-|command|docker compose|the compose front end, split on spaces into words (quotes are not parsed); its first word is the container engine
+stack|engine_check|command|-|command|docker info|engine-up probe, run before a selected compose entry starts, before a compose entry whose option is off is stopped, and by --stop whenever the config has a compose entry
+stack|engine_start|text|-|command|empty|how to start the engine; empty means stop with a hint
+stack|engine_timeout|int:1:3600|-|seconds|240|deadline for the engine to come up
+stack|open_url|url|-|url|smoke_url|the address printed on the Open line when the smoke check passed or no smoke_url is set; marked "not checked" unless it is the smoke_url and the smoke check passed
+stack|smoke_url|url|-|url|empty|end-to-end check; one fetch per attempt
+stack|smoke_expect|int:100:599|-|status|200|HTTP status the smoke check needs
+stack|smoke_forbid|regex|-|regex|empty|a pattern that must not appear in a non-empty smoke body
+stack|smoke_requires|name|-|entry|empty|run the smoke check only when this entry started
+stack|smoke_timeout|int:1:3600|-|seconds|200|deadline for the smoke check
+stack|classify_ignore|regex|repeat|regex|empty|log lines removed before signatures are tried
+stack|defect_owner|id|-|owner id|upstream|owner named on the known-defect summary
+stack|keep_awake|enum:auto,off|-|auto, off|auto|keep the machine awake with caffeinate while the run lasts
+stack|repair|enum:auto,ask,never|-|auto, ask, never|auto|contract repair policy; --no-repair forces never
+entry|description|text|-|text|empty|menu and plan text
+entry|stage|name|-|stage id|service: services, job: build, compose: infra, env: prepare|the stage it runs in
+entry|tier|enum:essential,recommended,optional|-|essential, recommended, optional|optional|cumulative selection tiers
+entry|groups|names|-|group list|empty|menu membership and --select group:NAME
+entry|pick|enum:yes,no|-|yes, no|yes for service, no otherwise|appears in a menu
+entry|always|enum:yes,no|-|yes, no|no|runs even when nothing selected depends on it
+entry|depends_on|names|-|entry list|empty|runs after these; selecting it selects them
+entry|option|name|-|option id|empty|runs only when that option is on
+entry|requires|command|repeat|command|empty|a command that must exist when this entry is selected
+entry|files|text|repeat|path|empty|must exist before anything starts
+entry|needs|text|repeat|path|empty|must exist just before this entry starts
+entry|needs_hint|line|-|text|empty|printed when a needs path is missing
+entry|precheck|command|-|command|empty|must exit 0 before this entry starts
+entry|precheck_hint|line|-|text|empty|printed when the precheck fails
+entry|on_fail|enum:abort,count,warn|-|abort, count, warn|count for service, abort otherwise|hard stop, counted failure (partial), or degraded
+entry|env|kv|repeat|KEY=VALUE|empty|literal environment for this entry only; not [compose]
+entry|env_file|text|-|path|empty|KEY=VALUE lines read literally, never sourced; not [compose]
+entry|env_from|names|-|env list|empty|providers whose values only this entry receives; not [compose]
+entry|log|text|-|path|LOG_DIR/NAME.log|this entry's log, truncated on each start
+entry|known_defect|line|-|text|empty|never started: a DEFECT line, not counted as a failure
+entry|known_defect_check|command|-|command|empty|exit 0 means defective, so the entry is skipped
+service|dir|text|-|path|STACK_ROOT|working folder
+service|build|command|-|command|empty|runs before start; if it fails, the entry fails as its on_fail says and is not started
+service|build_timeout|int:1:86400|-|seconds|900|build deadline
+service|start|command|required|command|none, required|the long-running process, started in its own process group
+service|port|int:1024:65535|-|port|empty|the port it listens on, exported as PORT
+service|port_env|envname|-|env name|empty|one more variable that carries the port; needs port
+service|url|url|-|url|empty|shown in the menu and the summary
+service|ready|text|-|probe|port when port is set, else alive 5|port, http URL [STATUS], cmd COMMAND, or alive SECONDS
+service|ready_timeout|int:1:3600|-|seconds|60|readiness deadline
+service|stop_timeout|int:1:600|-|seconds|10|grace between TERM and KILL
+service|toolchain|enum:none,nvm|-|none, nvm|none|nvm: put the node that nvm which names on PATH
+job|dir|text|-|path|STACK_ROOT|working folder
+job|run|command|required|command|none, required|the job's command, run under a deadline in its own process group
+job|run_if|command|-|command|empty|exit 0 runs the job, 1 skips it, anything else is an error
+job|timeout|int:1:86400|-|seconds|600|job deadline; a job still running past it is stopped with its process group
+job|trust_exit|enum:yes,no|-|yes, no|yes|a non-zero exit fails the job
+job|ok_marker|regex|-|regex|empty|the job's output must contain it to pass
+job|fail_marker|regex|-|regex|empty|the job fails when its output contains it
+job|fail_detail|regex|-|regex|empty|up to five distinct matching lines of the job's output, each cut to 160 characters, are shown when the job fails
+job|reason_marker|regex|-|regex|empty|the first matching line of the job's output is quoted in the failure
+job|report|command|-|command|empty|after the job passes, the first line it prints becomes one INFO line
+compose|services|svcnames|required|name list|none, required|compose service names
+compose|ready|enum:healthy,running|-|healthy, running|healthy|healthy uses the health check when one exists, else the running state
+compose|ready_timeout|int:1:3600|-|seconds|180|readiness deadline
+env|run|command|required|command|none, required|prints KEY=VALUE lines; values stay in memory
+env|timeout|int:1:3600|-|seconds|60|provider deadline
+check|stage|name|-|stage id|the stage before build, else the first stage|checks run at the end of this stage
+check|level|enum:required,advisory|-|required, advisory|required|an unmet required check blocks its dependent
+check|dependent|name|-|entry or all|all|the entry that needs this check; a required check must run in an earlier stage than a named dependent
+check|probe|command|required|command|none, required|exit 0 means satisfied
+check|gate|name|-|check id|empty|a check that must pass first, in the same or an earlier stage, and that runs whenever this one does; if it does not pass, this one is not checked
+check|consequence|text|-|text|empty|what goes wrong when it stays unmet
+check|repair|command|-|command|empty|fixes the unmet condition of a required check; needs target or backup
+check|target|text|-|path|empty|a file copied into the backups folder before the repair
+check|backup|command|-|command|empty|a command that must succeed before the repair
+option|question|line|required|text|none, required|asked once per run at a terminal
+option|default|enum:yes,no|-|yes, no|no|used without a terminal and on a blank answer
+option|when_off|enum:leave,stop|-|leave, stop|leave|stop: stop this option's entries while it is off
+signature|match|regex|required|regex|none, required|pattern tried against the output of an entry whose command failed
+signature|also|regex|-|regex|empty|a second pattern that must also match
+signature|owner|id|required|owner id|none, required|who should act
+signature|explain|line|required|text|none, required|plain explanation shown with the owner
+signature|applies_to|kinds|-|kind list|every kind|service, job, compose, env
+heal|for|names|required|entry list|none, required|services this heal may help
+heal|when_log|regex|-|regex|empty|heal when the failed service's output matches
+heal|when|command|-|command|empty|heal when this probe exits 0
+heal|run|command|required|command|none, required|the heal; one attempt per service per run; when it exits 0, the service is started once more
+heal|settle|int:0:600|-|seconds|0|wait after the heal, before the service is started again
+heal|timeout|int:1:3600|-|seconds|60|heal deadline
+heal|env_from|names|-|env list|empty|providers whose values the heal's run receives (its when probe does not)
+owner|label|line|required|text|none, required|how the owner is printed, for example THIS MACHINE
+owner|advice|line|-|text|empty|one more line printed under each fault for this owner
+EOF
+}
+
+su_declare_schema() {
+  local kind key type flags shown default meaning k kinds
+  conf_schema_reset
+  conf_schema_kind stack one -
+  for k in service job compose env check option heal; do
+    conf_schema_kind "$k" many "$SU_NAME_ERE"
+  done
+  conf_schema_kind signature many "$SU_ID_ERE"
+  conf_schema_kind owner many "$SU_ID_ERE"
+  SU_PT_MAP=" "
+  while IFS='|' read -r kind key type flags shown default meaning; do
+    [ -n "$kind" ] || continue
+    if [ "$kind" = entry ]; then kinds="service job compose env"; else kinds=$kind; fi
+    for k in $kinds; do
+      case $type in
+        name|names|id|kinds|kv|envname|url|svcnames|command|line)
+          SU_PT_MAP="$SU_PT_MAP$k|$key=$type "
+          ;;
+      esac
+    done
+    case $type in
+      name|names|id|kinds|kv|envname|url|svcnames|command|line) type=text ;;
+    esac
+    for k in $kinds; do
+      case $flags in
+        required) conf_schema_key "$k" "$key" "$type" required ;;
+        repeat) conf_schema_key "$k" "$key" "$type" repeat ;;
+        *) conf_schema_key "$k" "$key" "$type" ;;
+      esac || { printf 'stack-up: schema row %s.%s is invalid\n' "$kind" "$key" >&2; exit 2; }
+    done
+  done <<EOF
+$(su_schema_rows)
+EOF
+}
+
+# Shape checks run in bash with explicit character lists: a match: type costs
+# one grep process per value, and bash 3.2 matches [a-z] against capitals in a
+# UTF-8 locale. The library's name: type covers single names this way, but
+# not URLs, KEY=VALUE values or compose service names; names and name lists
+# stay here so every shape reports through the same hints.
+SU_LOWER=abcdefghijklmnopqrstuvwxyz
+SU_UPPER=ABCDEFGHIJKLMNOPQRSTUVWXYZ
+SU_DIGITS=0123456789
+
+su_shape_ok() {
+  local shape=$1 value=$2 word first
+  case $shape in
+    name|id)
+      [ -n "$value" ] && [ "${#value}" -le 40 ] || return 1
+      first=${value%"${value#?}"}
+      case $first in
+        [!$SU_LOWER$SU_DIGITS]) return 1 ;;
+      esac
+      if [ "$shape" = name ]; then
+        case $value in *[!$SU_LOWER$SU_DIGITS-]*) return 1 ;; esac
+      else
+        case $value in *[!$SU_LOWER$SU_DIGITS._-]*) return 1 ;; esac
+      fi
+      return 0
+      ;;
+    names|kinds)
+      for word in $value; do
+        su_shape_ok name "$word" || return 1
+      done
+      return 0
+      ;;
+    envname)
+      [ -n "$value" ] || return 1
+      first=${value%"${value#?}"}
+      case $first in
+        [!$SU_LOWER${SU_UPPER}_]) return 1 ;;
+      esac
+      case $value in *[!$SU_LOWER$SU_UPPER${SU_DIGITS}_]*) return 1 ;; esac
+      return 0
+      ;;
+    kv)
+      case $value in *=*) ;; *) return 1 ;; esac
+      su_shape_ok envname "${value%%=*}"
+      return
+      ;;
+    url)
+      case $value in
+        http://?*|https://?*) ;;
+        *) return 1 ;;
+      esac
+      case $value in *[" $SU_TAB"]*) return 1 ;; esac
+      return 0
+      ;;
+    command|line)
+      case $value in *[!" $SU_TAB"]*) return 0 ;; esac
+      return 1
+      ;;
+    svcnames)
+      case $value in *[\*\?\[]*) return 1 ;; esac
+      for word in $value; do
+        first=${word%"${word#?}"}
+        case $first in [!$SU_LOWER$SU_UPPER$SU_DIGITS]) return 1 ;; esac
+        case $word in *[!$SU_LOWER$SU_UPPER${SU_DIGITS}_.-]*) return 1 ;; esac
+      done
+      return 0
+      ;;
+  esac
+  return 0
+}
+
+su_shape_hint() {
+  case $1 in
+    name) printf 'a lowercase name: a-z, 0-9 and -, starting with a letter or digit, up to 40 characters' ;;
+    names) printf 'a space-separated list of lowercase names (a-z, 0-9, -)' ;;
+    id) printf 'an id: a-z, 0-9, ., _ and -, starting with a letter or digit' ;;
+    kinds) printf 'a space-separated list of entry kinds' ;;
+    kv) printf 'KEY=VALUE with KEY made of letters, digits and _' ;;
+    envname) printf 'a variable name made of letters, digits and _' ;;
+    url) printf 'a URL that starts with http:// or https:// and has no spaces' ;;
+    svcnames) printf 'a space-separated list of compose service names' ;;
+    command) printf 'a command, not blank' ;;
+    line) printf 'a line of text, not blank' ;;
+  esac
+}
+
+su_check_shapes() {
+  local i=0 row kind rest name key value shape label
+  while [ "$i" -lt "${#CONF_ROWS[@]}" ]; do
+    row=${CONF_ROWS[$i]}
+    kind=${row%%|*}
+    rest=${row#*|}
+    name=${rest%%|*}
+    rest=${rest#*|}
+    key=${rest%%|*}
+    value=${rest#*|}
+    case $SU_PT_MAP in
+      *" $kind|$key="*)
+        shape=${SU_PT_MAP#*" $kind|$key="}
+        shape=${shape%% *}
+        if ! su_shape_ok "$shape" "$value"; then
+          if [ -n "$name" ]; then label="[$kind $name]"; else label="[$kind]"; fi
+          conf_error "${CONF_ROW_LINES[$i]}" "$key in $label must be $(su_shape_hint "$shape"), got \"$value\""
+        fi
+        ;;
+    esac
+    i=$((i + 1))
+  done
+}
+
+su_print_schema() {
+  local kind key type flags shown default meaning
+  while IFS='|' read -r kind key type flags shown default meaning; do
+    [ -n "$kind" ] || continue
+    printf '%s|%s|%s|%s|%s|%s\n' "$kind" "$key" "$shown" "$flags" "$default" "$meaning"
+  done <<EOF
+$(su_schema_rows)
+EOF
+}
+
+# ---------------------------------------------------------------- arguments
+
+su_set_mode() {
+  if [ "$SU_MODE" != up ] && [ "$SU_MODE" != "$1" ]; then
+    su_usage_error "--$SU_MODE and --$1 cannot be combined"
+  fi
+  SU_MODE=$1
+}
+
+su_parse_args() {
+  SU_MODE=up
+  SU_CONFIG=""
+  SU_ROOT_OVERRIDE=""
+  SU_SELECT=""
+  SU_SELECT_GIVEN=0
+  SU_WITH=""
+  SU_WITHOUT=""
+  SU_YES=0
+  SU_NO_REPAIR=0
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --config|--root|--select|--with|--without)
+        [ "$#" -ge 2 ] || su_usage_error "$1 needs a value"
+        case $1 in
+          --config) [ -n "$2" ] || su_usage_error "--config needs a path, not an empty value"; SU_CONFIG=$2 ;;
+          --root) [ -n "$2" ] || su_usage_error "--root needs a path, not an empty value"; SU_ROOT_OVERRIDE=$2 ;;
+          --select) SU_SELECT=$2; SU_SELECT_GIVEN=1 ;;
+          --with) SU_WITH="$SU_WITH $2" ;;
+          --without) SU_WITHOUT="$SU_WITHOUT $2" ;;
+        esac
+        shift 2
+        continue
+        ;;
+      --plan|--dry-run) su_set_mode plan ;;
+      --check) su_set_mode check ;;
+      --stop) su_set_mode stop ;;
+      --clean) su_set_mode clean ;;
+      --print-config) su_set_mode print-config ;;
+      --print-schema) su_set_mode print-schema ;;
+      --print-paths) su_set_mode print-paths ;;
+      --yes) SU_YES=1 ;;
+      --no-repair) SU_NO_REPAIR=1 ;;
+      --version) printf 'stack-up %s\n' "$SU_VERSION"; exit 0 ;;
+      -h|--help) su_usage; exit 0 ;;
+      -*) su_usage_error "unknown flag $1" ;;
+      *) su_usage_error "unexpected argument $1" ;;
+    esac
+    shift
+  done
+  if [ "$SU_YES" = 1 ]; then
+    PROMPT_INTERACTIVE=0
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- config access
+
+SU_V=""
+
+su_cfg() {
+  local prefix="$1|$2|$3|" i=0
+  while [ "$i" -lt "${#CONF_ROWS[@]}" ]; do
+    case ${CONF_ROWS[$i]} in
+      "$prefix"*)
+        SU_V=${CONF_ROWS[$i]#"$prefix"}
+        return 0
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  SU_V=${4:-}
+  return 1
+}
+
+su_cfg_all() {
+  local prefix="$1|$2|$3|" i=0
+  SU_LIST=()
+  while [ "$i" -lt "${#CONF_ROWS[@]}" ]; do
+    case ${CONF_ROWS[$i]} in
+      "$prefix"*) SU_LIST[${#SU_LIST[@]}]=${CONF_ROWS[$i]#"$prefix"} ;;
+    esac
+    i=$((i + 1))
+  done
+  [ "${#SU_LIST[@]}" -gt 0 ]
+}
+
+su_line() {
+  conf_line "$@" 2>/dev/null || printf '\n'
+}
+
+su_err() {
+  local line=$1
+  shift
+  conf_error "$line" "$*"
+}
+
+# Placeholders are replaced by their variables' text and never evaluated, so a
+# config value cannot run a command through one.
+su_expand() {
+  local out
+  if ! out=$(conf_expand "$1" STACK_ROOT STACK_STATE HOME PORT); then
+    SU_X=$out
+    return 1
+  fi
+  SU_X=$out
+  return 0
+}
+
+su_abs() {
+  case $1 in
+    /*) SU_X=$1 ;;
+    *) SU_X=$2/$1 ;;
+  esac
+}
+
+su_path() {
+  if ! su_expand "$1"; then
+    return 1
+  fi
+  su_abs "$SU_X" "$STACK_ROOT"
+  return 0
+}
+
+# ${PORT} in an entry path is the entry's own port, as its child exports it,
+# so the engine and the child resolve the same path.
+su_entry_path() {
+  local saved=${PORT-} was_set=${PORT+1} status
+  PORT=${SU_E_PORT[$1]}
+  su_path "$2"
+  status=$?
+  if [ -n "$was_set" ]; then PORT=$saved; else unset PORT; fi
+  return "$status"
+}
+
+# ---------------------------------------------------------------- model
+
+SU_E_NAME=(); SU_E_KIND=(); SU_E_STAGE=(); SU_E_TIER=(); SU_E_PICK=(); SU_E_ALWAYS=()
+SU_E_DEPS=(); SU_E_OPTION=(); SU_E_ONFAIL=(); SU_E_GROUPS=(); SU_E_PORT=(); SU_E_SEL=()
+SU_E_STATE=(); SU_E_ENVFROM=(); SU_E_DUR=(); SU_E_PID=(); SU_E_HEALED=(); SU_E_NODE=()
+SU_EXTRA_PROVIDERS=""
+SU_ADDED=()
+SU_C_NAME=(); SU_C_STAGE=(); SU_C_LEVEL=(); SU_C_DEP=(); SU_C_GATE=(); SU_C_STATE=()
+SU_O_NAME=(); SU_O_ON=(); SU_O_SOURCE=()
+
+su_entry_index() {
+  local i=0
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    if [ "${SU_E_NAME[$i]}" = "$1" ]; then
+      SU_I=$i
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+su_check_index() {
+  local i=0
+  while [ "$i" -lt "${#SU_C_NAME[@]}" ]; do
+    if [ "${SU_C_NAME[$i]}" = "$1" ]; then
+      SU_I=$i
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+su_option_index() {
+  local i=0
+  while [ "$i" -lt "${#SU_O_NAME[@]}" ]; do
+    if [ "${SU_O_NAME[$i]}" = "$1" ]; then
+      SU_I=$i
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+su_stage_index() {
+  local i=0 stage
+  for stage in $SU_STAGES; do
+    if [ "$stage" = "$1" ]; then
+      SU_I=$i
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+su_default_check_stage() {
+  local previous="" stage
+  for stage in $SU_STAGES; do
+    if [ "$stage" = build ] && [ -n "$previous" ]; then
+      printf '%s\n' "$previous"
+      return 0
+    fi
+    [ -n "$previous" ] || previous=$stage
+    [ "$stage" = build ] || previous=$stage
+  done
+  for stage in $SU_STAGES; do
+    printf '%s\n' "$stage"
+    return 0
+  done
+}
+
+su_load_model() {
+  local i kind name stage line dep word n=0 d j seen ready rest words named timeout
+  su_cfg stack "" name; SU_NAME=$SU_V
+  su_cfg stack "" title "$(printf '%s' "$SU_NAME" | LC_ALL=C tr '[:lower:]' '[:upper:]')"; SU_TITLE=$SU_V
+  su_cfg stack "" subtitle ""; SU_SUBTITLE=$SU_V
+  su_cfg stack "" stages "$SU_DEFAULT_STAGES"; SU_STAGES=$SU_V
+  [ -n "$SU_STAGES" ] || SU_STAGES=$SU_DEFAULT_STAGES
+  su_cfg stack "" parallel_stages ""; SU_PARALLEL=$SU_V
+  for word in stages parallel_stages; do
+    named=""
+    if [ "$word" = stages ]; then rest=$SU_STAGES; else rest=$SU_PARALLEL; fi
+    for stage in $rest; do
+      if util_contains_word "$stage" "$named"; then
+        su_err "$(su_line stack "" "$word")" "$word names $stage twice"
+      fi
+      named="$named $stage"
+    done
+  done
+  i=0
+  while [ "$i" -lt "${#CONF_SECTIONS[@]}" ]; do
+    kind=${CONF_SECTIONS[$i]%%|*}
+    name=${CONF_SECTIONS[$i]#*|}
+    case $kind in
+      service|job|compose|env)
+        if su_entry_index "$name"; then
+          su_err "${CONF_SECTION_LINES[$i]}" "the name $name is already used by [${SU_E_KIND[$SU_I]} $name]; service, job, compose and env share one namespace"
+        else
+          n=${#SU_E_NAME[@]}
+          SU_E_NAME[n]=$name
+          SU_E_KIND[n]=$kind
+          case $kind in
+            service) stage=services; SU_E_PICK[n]=yes; SU_E_ONFAIL[n]=count ;;
+            job) stage=build; SU_E_PICK[n]=no; SU_E_ONFAIL[n]=abort ;;
+            compose) stage=infra; SU_E_PICK[n]=no; SU_E_ONFAIL[n]=abort ;;
+            env) stage=prepare; SU_E_PICK[n]=no; SU_E_ONFAIL[n]=abort ;;
+          esac
+          su_cfg "$kind" "$name" stage "$stage"; SU_E_STAGE[n]=$SU_V
+          su_cfg "$kind" "$name" tier optional; SU_E_TIER[n]=$SU_V
+          su_cfg "$kind" "$name" pick "${SU_E_PICK[$n]}"; SU_E_PICK[n]=$SU_V
+          su_cfg "$kind" "$name" always no; SU_E_ALWAYS[n]=$SU_V
+          su_cfg "$kind" "$name" on_fail "${SU_E_ONFAIL[$n]}"; SU_E_ONFAIL[n]=$SU_V
+          su_cfg "$kind" "$name" groups ""; SU_E_GROUPS[n]=$SU_V
+          su_cfg "$kind" "$name" option ""; SU_E_OPTION[n]=$SU_V
+          su_cfg "$kind" "$name" port ""; SU_E_PORT[n]=$SU_V
+          su_cfg "$kind" "$name" env_from ""; SU_E_ENVFROM[n]=$SU_V
+          su_cfg "$kind" "$name" depends_on ""
+          SU_E_DEPS[n]=$(su_words "$SU_V ${SU_E_ENVFROM[$n]}")
+          SU_E_SEL[n]=0
+          SU_E_STATE[n]=pending
+          SU_E_DUR[n]=""
+        fi
+        ;;
+      check)
+        n=${#SU_C_NAME[@]}
+        SU_C_NAME[n]=$name
+        su_cfg check "$name" stage ""; SU_C_STAGE[n]=$SU_V
+        su_cfg check "$name" level required; SU_C_LEVEL[n]=$SU_V
+        su_cfg check "$name" dependent all; SU_C_DEP[n]=$SU_V
+        su_cfg check "$name" gate ""; SU_C_GATE[n]=$SU_V
+        SU_C_STATE[n]=pending
+        ;;
+      option)
+        n=${#SU_O_NAME[@]}
+        SU_O_NAME[n]=$name
+        su_cfg option "$name" default no; SU_O_ON[n]=$SU_V
+        SU_O_SOURCE[n]=default
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  [ "${#SU_E_NAME[@]}" -gt 0 ] || su_err "" "the config declares no [service], [job], [compose] or [env] entry"
+  for stage in $SU_PARALLEL; do
+    su_stage_index "$stage" || su_err "$(su_line stack "" parallel_stages)" "parallel_stages names $stage, which is not in stages"
+  done
+  i=0
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    kind=${SU_E_KIND[$i]}
+    name=${SU_E_NAME[$i]}
+    line=$(su_line "$kind" "$name")
+    if ! su_stage_index "${SU_E_STAGE[$i]}"; then
+      su_err "$(su_line "$kind" "$name" stage | grep . || printf '%s' "$line")" "[$kind $name] runs in stage ${SU_E_STAGE[$i]}, which is not in [stack] stages ($SU_STAGES)"
+    fi
+    for dep in ${SU_E_DEPS[$i]}; do
+      if [ "$dep" = "$name" ]; then
+        su_err "$line" "[$kind $name] depends on itself"
+      elif ! su_entry_index "$dep"; then
+        su_err "$line" "[$kind $name] depends on $dep, which is not a declared entry"
+      else
+        j=$SU_I
+        if su_stage_index "${SU_E_STAGE[$j]}"; then
+          d=$SU_I
+          if su_stage_index "${SU_E_STAGE[$i]}" && [ "$d" -gt "$SU_I" ]; then
+            su_err "$line" "[$kind $name] depends on $dep, which runs in the later stage ${SU_E_STAGE[$j]}"
+          fi
+        fi
+      fi
+    done
+    if [ "$kind" = compose ]; then
+      if su_cfg compose "$name" services; then
+        case $SU_V in
+          *[!" $SU_TAB"]*) ;;
+          *) su_err "$(su_line compose "$name" services)" "services in [compose $name] is empty; name the compose services this entry starts and stops, because compose given no names acts on every service of the project" ;;
+        esac
+      fi
+      for key in env env_file env_from; do
+        if su_cfg_all compose "$name" "$key"; then
+          su_err "$(su_line compose "$name" "$key")" "$key is not used by [compose $name]: compose calls run without an entry's environment, so set those values where compose itself reads them"
+        fi
+      done
+    fi
+    for dep in ${SU_E_ENVFROM[$i]}; do
+      if su_entry_index "$dep" && [ "${SU_E_KIND[$SU_I]}" != env ]; then
+        su_err "$(su_line "$kind" "$name" env_from)" "env_from names $dep, which is a ${SU_E_KIND[$SU_I]}, not an [env] provider"
+      fi
+    done
+    if [ -n "${SU_E_OPTION[$i]}" ] && ! su_option_index "${SU_E_OPTION[$i]}"; then
+      su_err "$(su_line "$kind" "$name" option)" "option ${SU_E_OPTION[$i]} is not declared as an [option] section"
+    fi
+    if [ "$kind" = service ]; then
+      if su_cfg service "$name" ready && [ -z "$SU_V" ]; then
+        su_err "$(su_line service "$name" ready)" "ready in [service $name] is empty; remove the key or give a probe"
+      fi
+      if su_cfg service "$name" port_env && [ -z "${SU_E_PORT[$i]}" ]; then
+        su_err "$(su_line service "$name" port_env)" "port_env in [service $name] needs a port"
+      fi
+      su_cfg service "$name" ready_timeout 60
+      timeout=$SU_V
+      su_cfg service "$name" ready ""
+      ready=$SU_V
+      if [ -z "$ready" ] && [ -z "${SU_E_PORT[$i]}" ] && util_is_uint "$timeout" && [ "$timeout" -le 5 ]; then
+        su_err "$(su_line service "$name" ready_timeout)" "ready_timeout $timeout is not longer than the default ready = alive 5; set ready or a longer ready_timeout"
+      fi
+      [ -n "${SU_E_PORT[$i]}" ] || su_refuse_port "$(su_line service "$name" ready)" "$ready" "ready in [service $name]"
+      case $ready in
+        'http '*|'alive '*)
+          su_expand "$ready" || { su_placeholder_why "$ready"; su_err "$(su_line service "$name" ready)" "ready in [service $name] $SU_WHY"; }
+          ;;
+      esac
+      case $ready in
+        '') ;;
+        port)
+          [ -n "${SU_E_PORT[$i]}" ] || su_err "$(su_line service "$name" ready)" "ready = port needs a port in [service $name]"
+          ;;
+        'http '*)
+          rest=${ready#http }
+          read -r -a words <<<"$rest"
+          if [ "${#words[@]}" -lt 1 ] || [ "${#words[@]}" -gt 2 ]; then
+            su_err "$(su_line service "$name" ready)" "ready = http needs a URL and an optional status"
+          else
+            case ${words[0]} in
+              http://*|https://*) ;;
+              *) su_err "$(su_line service "$name" ready)" "ready = http needs a URL that starts with http:// or https://" ;;
+            esac
+            if [ "${#words[@]}" -eq 2 ] && ! { util_is_uint "${words[1]}" && [ "${words[1]}" -ge 100 ] && [ "${words[1]}" -le 599 ]; }; then
+              su_err "$(su_line service "$name" ready)" "ready = http status must be 100-599, got ${words[1]}"
+            fi
+          fi
+          ;;
+        'cmd '*) ;;
+        'alive '*)
+          if ! util_is_uint "${ready#alive }" || [ "${ready#alive }" -lt 1 ]; then
+            su_err "$(su_line service "$name" ready)" "ready = alive needs a whole number of seconds, got ${ready#alive }"
+          elif util_is_uint "$timeout" && [ "${ready#alive }" -ge "$timeout" ]; then
+            su_err "$(su_line service "$name" ready)" "ready = alive ${ready#alive } needs a ready_timeout longer than ${ready#alive }, got $timeout"
+          fi
+          ;;
+        *) su_err "$(su_line service "$name" ready)" "ready must be port, http URL [STATUS], cmd COMMAND or alive SECONDS, got \"$ready\"" ;;
+      esac
+    fi
+    su_check_paths "$kind" "$name"
+    i=$((i + 1))
+  done
+  su_check_cycles
+  i=0
+  while [ "$i" -lt "${#SU_C_NAME[@]}" ]; do
+    name=${SU_C_NAME[$i]}
+    [ -n "${SU_C_STAGE[$i]}" ] || SU_C_STAGE[i]=$(su_default_check_stage)
+    su_stage_index "${SU_C_STAGE[$i]}" || su_err "$(su_line check "$name")" "[check $name] runs at the end of stage ${SU_C_STAGE[$i]}, which is not in [stack] stages"
+    if [ "${SU_C_DEP[$i]}" != all ] && ! su_entry_index "${SU_C_DEP[$i]}"; then
+      su_err "$(su_line check "$name" dependent)" "dependent ${SU_C_DEP[$i]} is not a declared entry (use an entry name or all)"
+    elif [ "${SU_C_DEP[$i]}" != all ] && [ "${SU_C_LEVEL[$i]}" = required ]; then
+      stage=${SU_E_STAGE[$SU_I]}
+      if su_stage_index "$stage"; then
+        d=$SU_I
+        if su_stage_index "${SU_C_STAGE[$i]}" && [ "$SU_I" -ge "$d" ]; then
+          line=$(su_line check "$name" stage | grep . || su_line check "$name")
+          su_err "$line" "[check $name] runs at the end of stage ${SU_C_STAGE[$i]}, but its dependent ${SU_C_DEP[$i]} starts in stage $stage, before the check could stop it; give the check an earlier stage, or make it advisory"
+        fi
+      fi
+    fi
+    if [ -n "${SU_C_GATE[$i]}" ]; then
+      if [ "${SU_C_GATE[$i]}" = "$name" ]; then
+        su_err "$(su_line check "$name" gate)" "[check $name] cannot gate on itself"
+      elif ! su_check_index "${SU_C_GATE[$i]}" || [ "$SU_I" -ge "$i" ]; then
+        su_err "$(su_line check "$name" gate)" "gate ${SU_C_GATE[$i]} must be a [check] declared above [check $name]"
+      else
+        j=$SU_I
+        if su_stage_index "${SU_C_STAGE[$j]}"; then
+          d=$SU_I
+          if su_stage_index "${SU_C_STAGE[$i]}" && [ "$d" -gt "$SU_I" ]; then
+            su_err "$(su_line check "$name" gate)" "gate ${SU_C_GATE[$i]} runs at the end of stage ${SU_C_STAGE[$j]}, after [check $name] in stage ${SU_C_STAGE[$i]}; give the gate the same or an earlier stage"
+          fi
+        fi
+      fi
+    fi
+    if su_cfg check "$name" repair && ! su_cfg check "$name" target && ! su_cfg check "$name" backup; then
+      su_err "$(su_line check "$name" repair)" "[check $name] has a repair but no target or backup, so the original could not be kept first"
+    fi
+    if [ "${SU_C_LEVEL[$i]}" = advisory ] && su_cfg check "$name" repair; then
+      su_err "$(su_line check "$name" repair)" "[check $name] is advisory, so its repair would never run; make it required or remove the repair"
+    fi
+    su_cfg check "$name" target "" && { su_expand "$SU_V" || { su_placeholder_why "$SU_V"; su_err "$(su_line check "$name" target)" "target $SU_WHY"; }; }
+    su_cfg check "$name" target "" && su_refuse_port "$(su_line check "$name" target)" "$SU_V" "target in [check $name]"
+    su_cfg check "$name" target "" && su_refuse_bare_dollar "$(su_line check "$name" target)" "$SU_V" "target in [check $name]"
+    if su_cfg check "$name" target && [ -z "$SU_V" ]; then
+      su_err "$(su_line check "$name" target)" "target in [check $name] is empty; remove the key or name a path"
+    fi
+    i=$((i + 1))
+  done
+  su_load_owners
+  su_load_signatures
+  su_cfg stack "" defect_owner upstream
+  su_owner_known "$SU_V" || su_err "$(su_line stack "" defect_owner)" "defect_owner $SU_V is not a built-in owner or an [owner] section"
+  if su_cfg stack "" smoke_requires; then
+    su_entry_index "$SU_V" || su_err "$(su_line stack "" smoke_requires)" "smoke_requires names $SU_V, which is not a declared entry"
+  fi
+  for name in $(conf_names heal); do
+    su_cfg heal "$name" for ""
+    for dep in $SU_V; do
+      if ! su_entry_index "$dep" || [ "${SU_E_KIND[$SU_I]}" != service ]; then
+        su_err "$(su_line heal "$name" for)" "[heal $name] is for $dep, which is not a declared [service]"
+      fi
+    done
+    if ! su_cfg heal "$name" when_log && ! su_cfg heal "$name" when; then
+      su_err "$(su_line heal "$name")" "[heal $name] needs when_log or when"
+    fi
+    su_cfg heal "$name" env_from ""
+    for dep in $SU_V; do
+      if ! su_entry_index "$dep" || [ "${SU_E_KIND[$SU_I]}" != env ]; then
+        su_err "$(su_line heal "$name" env_from)" "[heal $name] env_from names $dep, which is not an [env] provider"
+      fi
+    done
+  done
+  su_cfg stack "" menus ""
+  for word in $SU_V; do
+    seen=0
+    i=0
+    while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+      if [ "${SU_E_PICK[$i]}" = yes ] && util_contains_word "$word" "${SU_E_GROUPS[$i]}"; then
+        seen=1
+      fi
+      i=$((i + 1))
+    done
+    [ "$seen" = 1 ] || su_err "$(su_line stack "" menus)" "menu $word lists no pickable entry (no entry with pick = yes has it in groups)"
+  done
+  su_cfg stack "" default_select essential
+  su_pickable
+  if [ -n "$SU_V" ] && ! su_resolve_spec "$SU_V" "$SU_PICKABLE"; then
+    su_err "$(su_line stack "" default_select)" "default_select has \"$SU_BAD_TOKEN\", which matches no pickable entry"
+  fi
+  for word in root state_dir log_dir compose_files; do
+    su_cfg stack "" "$word" || continue
+    if [ -z "$SU_V" ]; then
+      su_err "$(su_line stack "" "$word")" "$word is empty; remove the key or name a path"
+      continue
+    fi
+    su_expand "$SU_V" || { su_placeholder_why "$SU_V"; su_err "$(su_line stack "" "$word")" "$word $SU_WHY"; }
+    su_refuse_port "$(su_line stack "" "$word")" "$SU_V" "$word"
+    su_refuse_bare_dollar "$(su_line stack "" "$word")" "$SU_V" "$word"
+    if [ "$word" = compose_files ]; then
+      case $SU_V in
+        *[\*\?\[]*) su_err "$(su_line stack "" compose_files)" "compose_files names a pattern (*, ? or [); list each compose file by name" ;;
+      esac
+    fi
+    if [ "$word" = root ]; then
+      # shellcheck disable=SC2016 # the literal placeholder text, not an expansion
+      case $SU_V in
+        *'${STACK_STATE}'*) su_err "$(su_line stack "" root)" "root cannot use \${STACK_STATE}, which is resolved after root" ;;
+      esac
+    fi
+    if [ "$word" = state_dir ]; then
+      # shellcheck disable=SC2016 # the literal placeholder text, not an expansion
+      case $SU_V in
+        *'${STACK_STATE}'*) su_err "$(su_line stack "" state_dir)" "state_dir cannot use \${STACK_STATE}, which is the folder it names" ;;
+      esac
+    fi
+  done
+}
+
+# ${PORT} is a service's own port; anywhere else it would expand to nothing.
+su_refuse_port() {
+  # shellcheck disable=SC2016 # the literal placeholder text, not an expansion
+  case $2 in
+    *'${PORT}'*) su_err "$1" "$3 uses \${PORT}, but only a service with a port has one" ;;
+  esac
+}
+
+# A path value is used as written, so a $ that does not open ${NAME} would
+# become part of a folder name instead of reading a variable.
+su_refuse_bare_dollar() {
+  local rest=$2
+  while :; do
+    case $rest in
+      *'$'*) rest=${rest#*'$'} ;;
+      *) return 0 ;;
+    esac
+    case $rest in
+      '{'*) ;;
+      *)
+        # shellcheck disable=SC2016 # the literal placeholder text, not an expansion
+        su_err "$1" "$3 has a \$ that does not start a placeholder: $2 (write \${HOME}, not \$HOME)"
+        return 0
+        ;;
+    esac
+  done
+}
+
+# Sets SU_WHY for a value whose placeholders could not all be replaced: a
+# documented placeholder whose variable is unset is named as such, not as
+# unknown. HINT is added to the unknown case only.
+su_placeholder_why() {
+  local hint=${2:-}
+  # shellcheck disable=SC2016 # the literal placeholder text, not an expansion
+  case $1 in
+    *'${HOME}'*)
+      if [ -z "${HOME+set}" ]; then
+        SU_WHY='uses ${HOME}, but HOME is not set'
+        return 0
+      fi
+      ;;
+  esac
+  SU_WHY="has an unknown placeholder: $1${hint:+ $hint}"
+}
+
+su_check_paths() {
+  local kind=$1 name=$2 key value has_port=0
+  su_cfg "$kind" "$name" port && has_port=1
+  for key in dir env_file log files needs; do
+    su_cfg_all "$kind" "$name" "$key" || continue
+    for value in "${SU_LIST[@]}"; do
+      su_expand "$value" || { su_placeholder_why "$value" "(use \${STACK_ROOT}, \${STACK_STATE} or \${HOME}, and \${PORT} in a service with a port)"; su_err "$(su_line "$kind" "$name" "$key")" "$key in [$kind $name] $SU_WHY"; }
+      [ -n "$value" ] || su_err "$(su_line "$kind" "$name" "$key")" "$key in [$kind $name] is empty; remove the key or name a path"
+      [ "$has_port" = 1 ] || su_refuse_port "$(su_line "$kind" "$name" "$key")" "$value" "$key in [$kind $name]"
+      su_refuse_bare_dollar "$(su_line "$kind" "$name" "$key")" "$value" "$key in [$kind $name]"
+    done
+  done
+}
+
+su_words() {
+  local out="" word
+  for word in $1; do
+    util_contains_word "$word" "$out" || out="$out $word"
+  done
+  printf '%s\n' "${out# }"
+}
+
+su_check_cycles() {
+  local placed="" progress=1 i dep ok n=${#SU_E_NAME[@]} count=0
+  while [ "$progress" = 1 ]; do
+    progress=0
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      if ! util_contains_word "$i" "$placed"; then
+        ok=1
+        for dep in ${SU_E_DEPS[$i]}; do
+          if su_entry_index "$dep" && ! util_contains_word "$SU_I" "$placed" && [ "$SU_I" != "$i" ]; then
+            ok=0
+          fi
+        done
+        if [ "$ok" = 1 ]; then
+          placed="$placed $i"
+          count=$((count + 1))
+          progress=1
+        fi
+      fi
+      i=$((i + 1))
+    done
+  done
+  [ "$count" -lt "$n" ] || return 0
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if ! util_contains_word "$i" "$placed"; then
+      su_err "$(su_line "${SU_E_KIND[$i]}" "${SU_E_NAME[$i]}" depends_on | grep . || su_line "${SU_E_KIND[$i]}" "${SU_E_NAME[$i]}")" "[${SU_E_KIND[$i]} ${SU_E_NAME[$i]}] is part of a dependency cycle"
+    fi
+    i=$((i + 1))
+  done
+}
+
+# ---------------------------------------------------------------- owners and signatures
+
+SU_OWNER_IDS=""
+SU_OWNER_LABELS=()
+
+su_load_owners() {
+  local id
+  SU_OWNER_IDS=""
+  SU_OWNER_LABELS=()
+  for id in $SU_BUILTIN_OWNERS; do
+    su_owner_add "$id" "$(su_builtin_label "$id")"
+  done
+  for id in $(conf_names owner); do
+    su_cfg owner "$id" label "$id"
+    su_owner_add "$id" "$SU_V"
+  done
+}
+
+su_builtin_label() {
+  case $1 in
+    this-machine) printf 'THIS MACHINE\n' ;;
+    local-config) printf 'LOCAL CONFIGURATION\n' ;;
+    local-data) printf 'LOCAL DATA\n' ;;
+    upstream) printf 'UPSTREAM CODE\n' ;;
+    needs-a-look) printf 'NEEDS A LOOK\n' ;;
+  esac
+}
+
+su_owner_add() {
+  local i=0 id
+  for id in $SU_OWNER_IDS; do
+    if [ "$id" = "$1" ]; then
+      SU_OWNER_LABELS[i]=$2
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  SU_OWNER_IDS="$SU_OWNER_IDS $1"
+  SU_OWNER_LABELS[i]=$2
+}
+
+su_owner_known() {
+  util_contains_word "$1" "$SU_OWNER_IDS"
+}
+
+su_owner_label() {
+  local i=0 id
+  for id in $SU_OWNER_IDS; do
+    if [ "$id" = "$1" ]; then
+      SU_LABEL=${SU_OWNER_LABELS[$i]}
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  SU_LABEL=$(util_to_lower "$1")
+  return 1
+}
+
+su_load_signatures() {
+  local id match also owner explain applies kind status
+  classify_reset
+  if su_cfg_all stack "" classify_ignore; then
+    for match in "${SU_LIST[@]}"; do
+      classify_ignore "$match" || su_err "$(su_line stack "" classify_ignore)" "classify_ignore is not a valid pattern: $match"
+    done
+  fi
+  for id in $(conf_names signature); do
+    su_cfg signature "$id" match ""; match=$SU_V
+    su_cfg signature "$id" also ""; also=$SU_V
+    su_cfg signature "$id" owner ""; owner=$SU_V
+    su_cfg signature "$id" explain ""; explain=$SU_V
+    su_cfg signature "$id" applies_to ""; applies=$SU_V
+    for kind in $applies; do
+      case $kind in
+        service|job|compose|env) ;;
+        *) su_err "$(su_line signature "$id" applies_to)" "applies_to names $kind; use service, job, compose or env" ;;
+      esac
+    done
+    if [ -n "$owner" ] && ! su_owner_known "$owner"; then
+      su_err "$(su_line signature "$id" owner)" "owner $owner is not a built-in owner or an [owner] section"
+      continue
+    fi
+    [ -n "$match" ] && [ -n "$owner" ] && [ -n "$explain" ] || continue
+    classify_add "$id" "$owner" "$explain" "$match" "$also" "$applies"
+    status=$?
+    [ "$status" = 0 ] || su_err "$(su_line signature "$id")" "[signature $id] could not be added (status $status)"
+  done
+  CLASSIFY_EMPTY_OWNER=this-machine
+  CLASSIFY_FALLBACK_OWNER=needs-a-look
+}
+
+# The owner comes from the first signature that matches the entry's own output,
+# but that copy of the output is deleted at once, so the LOG line names the
+# whole log.
+su_fault_from_log() {
+  local log=$1 kind=$2 output=$SU_RUN_DIR/fault-output.log
+  if { su_entry_output "$log" >| "$output"; } 2>/dev/null; then
+    classify_log "$output" "$kind" >/dev/null
+    rm -f -- "$output"
+  else
+    classify_log "$log" "$kind" >/dev/null
+  fi
+  su_owner_label "$CLASSIFY_OWNER"
+  report_fault "$SU_LABEL" "$CLASSIFY_EXPLAIN" "$log"
+  su_owner_advice "$CLASSIFY_OWNER"
+}
+
+su_fault() {
+  su_owner_label "$1"
+  report_fault "$SU_LABEL" "$2" "${3:-}"
+  su_owner_advice "$1"
+}
+
+su_owner_advice() {
+  if su_cfg owner "$1" advice; then
+    report_detail "$SU_V"
+  fi
+}
+
+# ---------------------------------------------------------------- paths
+
+su_resolve_paths() {
+  local config_dir state_home home
+  config_dir=${SU_CONFIG_ABS%/*}
+  if [ -n "$SU_ROOT_OVERRIDE" ]; then
+    su_abs "$SU_ROOT_OVERRIDE" "$PWD"
+    STACK_ROOT=$SU_X
+  elif su_cfg stack "" root; then
+    STACK_ROOT=$config_dir
+    su_expand "$SU_V"
+    su_abs "$SU_X" "$config_dir"
+    STACK_ROOT=$SU_X
+  else
+    STACK_ROOT=$config_dir
+  fi
+  if su_cfg stack "" state_dir; then
+    STACK_STATE=""
+    su_expand "$SU_V"
+    su_abs "$SU_X" "$STACK_ROOT"
+    STACK_STATE=$SU_X
+  else
+    # The XDG spec says to ignore a relative value; kept, it would move the
+    # launch table with the current folder. A relative HOME would do the same.
+    state_home=${XDG_STATE_HOME:-}
+    case $state_home in
+      /*) ;;
+      *) state_home="" ;;
+    esac
+    home=${HOME:-}
+    case $home in
+      /*) ;;
+      *) home="" ;;
+    esac
+    if [ -z "$state_home" ] && [ -z "$home" ]; then
+      printf 'stack-up: neither XDG_STATE_HOME nor HOME is an absolute path, so the state folder is unknown\n' >&2
+      exit 2
+    fi
+    STACK_STATE=${state_home:-$home/.local/state}/stack-up/$SU_NAME
+  fi
+  # The launch table separates its fields with |, so a record under such a
+  # folder would split in the wrong places and never prove its group.
+  case $STACK_STATE in
+    *'|'*)
+      printf 'stack-up: the state folder %s contains |, which the launch table uses to separate its fields; set state_dir or XDG_STATE_HOME to a folder without it\n' "$STACK_STATE" >&2
+      exit 2
+      ;;
+  esac
+  if su_cfg stack "" log_dir; then
+    su_expand "$SU_V"
+    su_abs "$SU_X" "$STACK_ROOT"
+    STACK_LOGS=$SU_X
+  else
+    STACK_LOGS=$STACK_STATE/logs
+  fi
+  ! su_cfg stack "" state_dir || su_guard_own_dir state_dir "$STACK_STATE"
+  ! su_cfg stack "" log_dir || su_guard_own_dir log_dir "$STACK_LOGS"
+  SU_RUN_DIR=$STACK_STATE/run
+  SU_LAUNCHED=$SU_RUN_DIR/launched.tsv
+  SU_TOKENS=$SU_RUN_DIR/tokens
+  SU_LOCK=$SU_RUN_DIR/lock
+  SU_BACKUPS=$STACK_STATE/backups
+  SU_REPAIR_LOG=$STACK_STATE/repair.log
+  SU_HEALS=$STACK_STATE/heals.tsv
+  SU_HISTORY=$STACK_STATE/history.tsv
+  STACK_COMPOSE=""
+  SU_COMPOSE_FILES=()
+  local file
+  su_cfg stack "" compose_files ""
+  for file in $SU_V; do
+    su_path "$file"
+    SU_COMPOSE_FILES[${#SU_COMPOSE_FILES[@]}]=$SU_X
+    STACK_COMPOSE="$STACK_COMPOSE $SU_X"
+  done
+  STACK_COMPOSE=${STACK_COMPOSE# }
+  su_cfg stack "" compose_command "docker compose"; SU_COMPOSE_CMD=$SU_V
+  SU_ENGINE=${SU_COMPOSE_CMD%% *}
+  export STACK_ROOT STACK_STATE STACK_LOGS STACK_COMPOSE
+  STACK_NAME=$SU_NAME
+  export STACK_NAME
+}
+
+# A state or log folder that is the project root, HOME, or a folder above
+# either would get its mode changed and be offered to rm -r by --print-paths.
+su_guard_own_dir() {
+  local key=$1 dir=$2 real guard
+  [ -d "$dir" ] || return 0
+  real=$(cd -- "$dir" 2>/dev/null && pwd -P) || return 0
+  for guard in "$STACK_ROOT" "${HOME:-}"; do
+    [ -n "$guard" ] && [ -d "$guard" ] || continue
+    guard=$(cd -- "$guard" 2>/dev/null && pwd -P) || continue
+    if [ "$real" = / ] || [ "$real" = "$guard" ] || [ "${guard#"$real"/}" != "$guard" ]; then
+      su_err "$(su_line stack "" "$key")" "$key is $real, which is $guard or a folder above it; give it a folder of its own"
+      printf 'stack-up: the config has 1 error(s); nothing was started\n' >&2
+      exit 2
+    fi
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- selection
+
+su_pickable() {
+  local i=0
+  SU_PICKABLE=""
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    [ "${SU_E_PICK[$i]}" = yes ] && SU_PICKABLE="$SU_PICKABLE ${SU_E_NAME[$i]}"
+    i=$((i + 1))
+  done
+  SU_PICKABLE=${SU_PICKABLE# }
+}
+
+su_menu_members() {
+  local i=0
+  SU_MENU=""
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    if [ "${SU_E_PICK[$i]}" = yes ] && { [ -z "$1" ] || util_contains_word "$1" "${SU_E_GROUPS[$i]}"; }; then
+      SU_MENU="$SU_MENU ${SU_E_NAME[$i]}"
+    fi
+    i=$((i + 1))
+  done
+  SU_MENU=${SU_MENU# }
+}
+
+su_pick_add() {
+  util_contains_word "$1" "$SU_PICKED" || SU_PICKED="${SU_PICKED:+$SU_PICKED }$1"
+}
+
+# Selection grammar: all wins anywhere, then none; otherwise tier words,
+# group:NAME, numbers, ranges (either direction) and names add up, first
+# mention kept. Numbers are read base 10 so 010 is ten.
+su_resolve_spec() {
+  local spec=$1 candidates=$2 token n count i name lo hi low high tier
+  local -a tokens cands
+  SU_PICKED=""
+  SU_BAD_TOKEN=""
+  case $spec in
+    *[$SU_UPPER]*) spec=$(util_to_lower "$spec") ;;
+  esac
+  spec=${spec//,/ }
+  read -r -a tokens <<<"$spec"
+  read -r -a cands <<<"$candidates"
+  count=${#cands[@]}
+  [ "${#tokens[@]}" -gt 0 ] || return 0
+  for token in "${tokens[@]}"; do
+    if [ "$token" = all ]; then
+      SU_PICKED=$candidates
+      return 0
+    fi
+  done
+  for token in "${tokens[@]}"; do
+    [ "$token" != none ] || return 0
+  done
+  for token in "${tokens[@]}"; do
+    case $token in
+      essential|ess|recommended|rec)
+        i=0
+        while [ "$i" -lt "$count" ]; do
+          su_entry_index "${cands[$i]}"
+          tier=${SU_E_TIER[$SU_I]}
+          case $token:$tier in
+            *:essential|recommended:recommended|rec:recommended) su_pick_add "${cands[$i]}" ;;
+          esac
+          i=$((i + 1))
+        done
+        ;;
+      group:*)
+        name=${token#group:}
+        n=0
+        i=0
+        while [ "$i" -lt "$count" ]; do
+          su_entry_index "${cands[$i]}"
+          if [ -n "$name" ] && util_contains_word "$name" "${SU_E_GROUPS[$SU_I]}"; then
+            su_pick_add "${cands[$i]}"
+            n=$((n + 1))
+          fi
+          i=$((i + 1))
+        done
+        if [ "$n" = 0 ]; then
+          SU_BAD_TOKEN=$token
+          return 1
+        fi
+        ;;
+      *[!0123456789-]*|-*|*-|*-*-*)
+        if util_contains_word "$token" "$candidates"; then
+          su_pick_add "$token"
+        else
+          SU_BAD_TOKEN=$token
+          return 1
+        fi
+        ;;
+      *-*)
+        lo=${token%-*}
+        hi=${token#*-}
+        if [ "${#lo}" -gt 9 ] || [ "${#hi}" -gt 9 ]; then
+          SU_BAD_TOKEN=$token
+          return 1
+        fi
+        lo=$((10#$lo))
+        hi=$((10#$hi))
+        if [ "$lo" -le "$hi" ]; then low=$lo; high=$hi; else low=$hi; high=$lo; fi
+        if [ "$low" -lt 1 ] || [ "$high" -gt "$count" ]; then
+          SU_BAD_TOKEN=$token
+          return 1
+        fi
+        n=$low
+        while [ "$n" -le "$high" ]; do
+          su_pick_add "${cands[$((n - 1))]}"
+          n=$((n + 1))
+        done
+        ;;
+      *)
+        if [ "${#token}" -gt 9 ]; then
+          SU_BAD_TOKEN=$token
+          return 1
+        fi
+        n=$((10#$token))
+        if [ "$n" -lt 1 ] || [ "$n" -gt "$count" ]; then
+          SU_BAD_TOKEN=$token
+          return 1
+        fi
+        su_pick_add "${cands[$((n - 1))]}"
+        ;;
+    esac
+  done
+  return 0
+}
+
+su_option_on() {
+  su_option_index "$1" && [ "${SU_O_ON[$SU_I]}" = yes ]
+}
+
+su_resolve_options() {
+  local may_ask=$1 i=0 name question
+  while [ "$i" -lt "${#SU_O_NAME[@]}" ]; do
+    name=${SU_O_NAME[$i]}
+    if util_contains_word "$name" "$SU_WITH"; then
+      SU_O_ON[i]=yes; SU_O_SOURCE[i]=--with
+    elif util_contains_word "$name" "$SU_WITHOUT"; then
+      SU_O_ON[i]=no; SU_O_SOURCE[i]=--without
+    elif [ "$may_ask" = 1 ]; then
+      su_cfg option "$name" question "Turn on $name?"
+      question=$SU_V
+      if su_ask_yes_no "$question" "${SU_O_ON[$i]}"; then SU_O_SOURCE[i]=answer; fi
+      SU_O_ON[i]=$SU_ANSWER
+    fi
+    i=$((i + 1))
+  done
+}
+
+su_select() {
+  local may_ask=$1 menus menu i name dep changed spec
+  su_pickable
+  SU_PICKED=""
+  if [ "$SU_SELECT_GIVEN" = 1 ]; then
+    su_resolve_spec "$SU_SELECT" "$SU_PICKABLE" || su_usage_error "--select: \"$SU_BAD_TOKEN\" matches no pickable entry ($SU_PICKABLE)"
+    SU_SELECT_SOURCE=--select
+  elif [ "$may_ask" = 1 ] && prompt_is_interactive; then
+    su_cfg stack "" menus ""
+    menus=$SU_V
+    [ -n "$menus" ] || menus=-
+    SU_SELECT_SOURCE=menu
+    local all_picked="" all_blank=1
+    for menu in $menus; do
+      [ "$menu" != - ] || menu=""
+      su_menu_members "$menu"
+      su_ask_menu "$menu" "$SU_MENU"
+      [ "$SU_ASK_BLANK" = 1 ] || all_blank=0
+      all_picked="$all_picked $SU_PICKED"
+    done
+    # With no menu answered, the selection is the one a run without a terminal
+    # makes; per-menu defaults would drop every entry in no listed group.
+    if [ "$all_blank" = 1 ]; then
+      su_cfg stack "" default_select essential
+      su_resolve_spec "$SU_V" "$SU_PICKABLE" || true
+    else
+      SU_PICKED=$(su_words "$all_picked")
+    fi
+  else
+    su_cfg stack "" default_select essential
+    spec=$SU_V
+    [ "$may_ask" != 1 ] || su_ask_line Selection "$spec" || true
+    su_resolve_spec "$spec" "$SU_PICKABLE" || true
+    SU_SELECT_SOURCE="default_select ($spec)"
+  fi
+  i=0
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    SU_E_SEL[i]=0
+    if util_contains_word "${SU_E_NAME[$i]}" "$SU_PICKED" || [ "${SU_E_ALWAYS[$i]}" = yes ]; then
+      SU_E_SEL[i]=1
+    fi
+    i=$((i + 1))
+  done
+  SU_ADDED=()
+  changed=1
+  while [ "$changed" = 1 ]; do
+    changed=0
+    i=0
+    while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+      if [ "${SU_E_SEL[$i]}" = 1 ]; then
+        for dep in ${SU_E_DEPS[$i]}; do
+          su_entry_index "$dep" || continue
+          if [ "${SU_E_SEL[$SU_I]}" = 0 ]; then
+            SU_E_SEL[SU_I]=1
+            SU_ADDED[${#SU_ADDED[@]}]="$dep because ${SU_E_NAME[$i]} needs it"
+            changed=1
+          fi
+        done
+      fi
+      i=$((i + 1))
+    done
+  done
+}
+
+# The answer device and the interactive switch are the library's own test seam
+# (PROMPT_TTY, PROMPT_INTERACTIVE); free-text answers such as the menu's are
+# read here on descriptor 7. A blank answer and a typed one both return 0, and
+# the menu and the selection treat them differently, so SU_ASK_BLANK stays 1
+# until an answer that was not blank is read.
+_SU_ASK_PATH=""
+SU_ASK_BLANK=1
+
+su_ask_line() {
+  local question=$1 default=$2 answer why="no terminal"
+  SU_ANSWER=$default
+  SU_ASK_BLANK=1
+  if ! prompt_is_interactive; then
+    [ "${SU_YES:-0}" != 1 ] || why=--yes
+    report_log ASK "$question ($why, so the default \"$default\" applies)"
+    return 1
+  fi
+  if [ "$_SU_ASK_PATH" != "$PROMPT_TTY" ]; then
+    exec 7<&-
+    if ! { exec 7<"$PROMPT_TTY"; } 2>/dev/null; then
+      _SU_ASK_PATH=""
+      report_log ASK "$question (cannot open $PROMPT_TTY, so the default \"$default\" applies)"
+      return 1
+    fi
+    _SU_ASK_PATH=$PROMPT_TTY
+  fi
+  printf '    %s?%s  %s %s[%s]%s ' "$TERM_COLOR_ACCENT" "$TERM_COLOR_RESET" "$question" "$TERM_COLOR_MUTED" "$default" "$TERM_COLOR_RESET" >&2
+  if ! read -r answer <&7; then
+    printf '\n' >&2
+    report_log ASK "$question (no answer could be read, so the default \"$default\" applies)"
+    return 1
+  fi
+  util_trim "$answer"
+  answer=$UTIL_TRIMMED
+  if [ -n "$answer" ]; then
+    SU_ASK_BLANK=0
+  else
+    answer=$default
+  fi
+  SU_ANSWER=$answer
+  report_log ASK "$question answered: $answer"
+  return 0
+}
+
+# Returns 1 when the default applied because no yes or no was given, so a
+# caller can tell an answer from a fallback.
+su_ask_yes_no() {
+  local attempt=0 answer
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    if ! su_ask_line "$1" "$2"; then
+      SU_ANSWER=$2
+      return 1
+    fi
+    answer=$(util_to_lower "$SU_ANSWER")
+    case $answer in
+      y|yes) SU_ANSWER=yes; return 0 ;;
+      n|no) SU_ANSWER=no; return 0 ;;
+    esac
+    printf '    %s!%s  answer yes or no\n' "$TERM_COLOR_WARNING" "$TERM_COLOR_RESET" >&2
+  done
+  SU_ANSWER=$2
+  report_log ASK "$1 (3 answers were not yes or no, so the default \"$2\" applies)"
+  return 1
+}
+
+su_print_menu() {
+  local title=$1 members=$2 n=1 name mark where
+  printf '\n    %s%s%s\n' "$TERM_COLOR_BOLD" "$title" "$TERM_COLOR_RESET" >&2
+  for name in $members; do
+    su_entry_index "$name"
+    case ${SU_E_TIER[$SU_I]} in
+      essential) mark='*' ;;
+      recommended) mark='+' ;;
+      *) mark=' ' ;;
+    esac
+    if [ -n "${SU_E_PORT[$SU_I]}" ]; then where=":${SU_E_PORT[$SU_I]}"; else where="no port"; fi
+    if su_cfg "${SU_E_KIND[$SU_I]}" "$name" url; then where=$SU_V; fi
+    su_cfg "${SU_E_KIND[$SU_I]}" "$name" description ""
+    printf '     %s%2d%s %s %-24s %s%-8s %s%s\n' "$TERM_COLOR_MUTED" "$n" "$TERM_COLOR_RESET" "$mark" "$name" "$TERM_COLOR_MUTED" "$where" "$SU_V" "$TERM_COLOR_RESET" >&2
+    n=$((n + 1))
+  done
+  printf '     %s* essential  + recommended%s\n' "$TERM_COLOR_MUTED" "$TERM_COLOR_RESET" >&2
+  printf '     essential  recommended  all  none  or 1,3  1-3  names  group:NAME\n' >&2
+}
+
+su_ask_menu() {
+  local group=$1 members=$2 attempt=0 default title answer
+  su_cfg stack "" default_select essential
+  default=$SU_V
+  if [ -n "$group" ]; then title="Pick from $group"; else title="Pick what to start"; fi
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    su_print_menu "$title" "$members"
+    if ! su_ask_line "Selection" "$default"; then
+      su_resolve_spec "$default" "$members" || true
+      SU_SELECT_SOURCE="default_select ($default)"
+      return 0
+    fi
+    # A blank answer takes the default as far as this menu offers it, even
+    # when that is nothing here; su_select decides what an all-blank run picks.
+    if [ "$SU_ASK_BLANK" = 1 ]; then
+      su_resolve_spec "$default" "$members" || true
+      return 0
+    fi
+    answer=$(util_to_lower "$SU_ANSWER")
+    if su_resolve_spec "$answer" "$members"; then
+      if [ -n "$SU_PICKED" ]; then
+        return 0
+      fi
+      case " ${answer//,/ } " in
+        *" none "*) return 0 ;;
+      esac
+    fi
+    printf '    %s!%s  nothing matched "%s"; try again\n' "$TERM_COLOR_WARNING" "$TERM_COLOR_RESET" "$SU_ANSWER" >&2
+  done
+  su_resolve_spec "$default" "$members" || true
+  report_log ASK "Selection (3 answers matched nothing, so the default \"$default\" applies)"
+  return 0
+}
+
+su_port_conflicts() {
+  local i=0 j port found=0
+  SU_CONFLICTS=""
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    port=${SU_E_PORT[$i]}
+    if [ "${SU_E_SEL[$i]}" = 1 ] && [ -n "$port" ] && su_entry_enabled "$i"; then
+      j=$((i + 1))
+      while [ "$j" -lt "${#SU_E_NAME[@]}" ]; do
+        if [ "${SU_E_SEL[$j]}" = 1 ] && [ "${SU_E_PORT[$j]}" = "$port" ] && su_entry_enabled "$j"; then
+          SU_CONFLICTS="${SU_CONFLICTS}port $port is declared by both ${SU_E_NAME[$i]} and ${SU_E_NAME[$j]}$SU_NL"
+          found=1
+        fi
+        j=$((j + 1))
+      done
+    fi
+    i=$((i + 1))
+  done
+  [ "$found" = 0 ]
+}
+
+su_entry_enabled() {
+  local option=${SU_E_OPTION[$1]}
+  [ -z "$option" ] || su_option_on "$option"
+}
+
+su_order_stage() {
+  local stage=$1 pending="" i dep ok progress next
+  SU_ORDER=""
+  i=0
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    if [ "${SU_E_SEL[$i]}" = 1 ] && [ "${SU_E_STAGE[$i]}" = "$stage" ]; then
+      pending="$pending $i"
+    fi
+    i=$((i + 1))
+  done
+  while [ -n "${pending// /}" ]; do
+    progress=0
+    for i in $pending; do
+      ok=1
+      for dep in ${SU_E_DEPS[$i]}; do
+        su_entry_index "$dep" || continue
+        if [ "${SU_E_STAGE[$SU_I]}" = "$stage" ] && util_contains_word "$SU_I" "$pending"; then
+          ok=0
+        fi
+      done
+      if [ "$ok" = 1 ]; then
+        SU_ORDER="$SU_ORDER $i"
+        next=""
+        for dep in $pending; do
+          [ "$dep" = "$i" ] || next="$next $dep"
+        done
+        pending=$next
+        progress=1
+        break
+      fi
+    done
+    [ "$progress" = 1 ] || break
+  done
+  SU_ORDER=${SU_ORDER# }
+}
+
+# ---------------------------------------------------------------- processes
+
+# The only places that signal: su_alive probes with signal 0, su_signal_group
+# signals a whole process group this tool created (signal 0 only asks the
+# kernel whether the group exists), and su_signal_launch stops a process
+# launched a moment earlier that could not be given its own group.
+su_alive() {
+  kill -0 "$1" 2>/dev/null
+}
+
+su_signal_group() {
+  kill "-$1" -- "-$2" 2>/dev/null
+}
+
+su_signal_launch() {
+  kill "-$1" "$2" 2>/dev/null
+}
+
+su_group_exists() {
+  su_signal_group 0 "$1"
+}
+
+# A group ID equal to the PID can only have been created by that process, and
+# the kernel never hands out a PID that is still in use as a group ID.
+su_leads_group() {
+  local pid=$1 tries=0
+  until su_group_exists "$pid"; do
+    su_alive "$pid" || return 1
+    [ "$tries" -lt 10 ] || return 1
+    tries=$((tries + 1))
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+  return 0
+}
+
+# Returns 0 with the members in SU_MEMBERS, 1 only when the group is proven
+# gone (pgrep lists nothing and the kernel has no such group), and 2 when that
+# cannot be decided (SU_UNSURE says why). pgrep can miss a group for a moment
+# around a fork or exec, so a disagreement is retried for about a second.
+su_members() {
+  local pgid=$1 status tries=0
+  SU_UNSURE=""
+  while :; do
+    SU_MEMBERS=$(pgrep -g "$pgid" 2>/dev/null)
+    status=$?
+    SU_MEMBERS=${SU_MEMBERS//$SU_NL/ }
+    case $status in
+      0) [ -z "$SU_MEMBERS" ] || return 0 ;;
+      1) su_group_exists "$pgid" || return 1 ;;
+    esac
+    if [ "$tries" -ge 10 ]; then
+      case $status in
+        0|1) SU_UNSURE="pgrep -g $pgid listed no process, but the system still reports process group $pgid" ;;
+        *) SU_UNSURE="pgrep -g $pgid failed with status $status" ;;
+      esac
+      return 2
+    fi
+    tries=$((tries + 1))
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+}
+
+# A process group is this stack's own when one of its members still holds the
+# launch token: an open file that only processes started by this tool inherit.
+# A group ID that was freed and reused by another program cannot pass this.
+# Returns 2 (SU_UNSURE says why) when lsof is missing: an empty holder list
+# would otherwise read as "not ours" and blame the group ID.
+su_group_is_ours() {
+  local pgid=$1 token=$2 holders pid
+  [ -f "$token" ] || return 1
+  if ! command -v lsof >/dev/null 2>&1; then
+    SU_UNSURE="lsof is not on PATH; it lives in /usr/sbin"
+    return 2
+  fi
+  su_members "$pgid" || return 1
+  holders=$(lsof -t -- "$token" 2>/dev/null | LC_ALL=C tr '\n' ' ')
+  for pid in $holders; do
+    util_contains_word "$pid" "$SU_MEMBERS" && return 0
+  done
+  return 1
+}
+
+# A process that holds a launch token but is not in the group recorded for it
+# (PGID empty when no record is left) was launched by this stack and then
+# moved to a process group of its own, or outlived a launch whose record was
+# never written. Such processes are named, never signalled. Returns 0 with
+# "PID (command)" entries in SU_STRAYS, 1 when there are none, and 2 when
+# that cannot be decided (no lsof, or the recorded group could not be checked).
+su_token_strays() {
+  local token=$1 pgid=${2:-} holders pid members=""
+  SU_STRAYS=""
+  [ -f "$token" ] || return 1
+  command -v lsof >/dev/null 2>&1 || return 2
+  holders=$(lsof -t -- "$token" 2>/dev/null | LC_ALL=C tr '\n' ' ')
+  [ -n "${holders// /}" ] || return 1
+  if [ -n "$pgid" ]; then
+    su_members "$pgid"
+    case $? in
+      0) members=$SU_MEMBERS ;;
+      2) return 2 ;;
+    esac
+  fi
+  for pid in $holders; do
+    util_contains_word "$pid" "$members" && continue
+    SU_STRAYS="$SU_STRAYS, PID $(su_describe_pid "$pid")"
+  done
+  SU_STRAYS=${SU_STRAYS#, }
+  [ -n "$SU_STRAYS" ]
+}
+
+# The entry name a token file was made for: NAME-YYYYMMDD-HHMMSS-PID.
+su_token_entry() {
+  local base=${1##*/}
+  SU_X=${base%-*-*-*}
+  [ -n "$SU_X" ] || SU_X=$base
+}
+
+su_describe_pid() {
+  local command
+  command=$(lsof -nP -p "$1" -Fc 2>/dev/null | LC_ALL=C sed -n 's/^c//p' | head -n 1)
+  printf '%s (%s)\n' "$1" "${command:-command unknown}"
+}
+
+su_listeners() {
+  SU_LISTENERS=$(lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | LC_ALL=C sort -u | LC_ALL=C tr '\n' ' ')
+  SU_LISTENERS=${SU_LISTENERS% }
+  [ -n "$SU_LISTENERS" ]
+}
+
+su_port_answers() {
+  nc -z 127.0.0.1 "$1" >/dev/null 2>&1
+}
+
+su_wait_group_gone() {
+  local pgid=$1 seconds=$2 started=$SECONDS
+  while :; do
+    su_members "$pgid"
+    [ "$?" != 1 ] || return 0
+    [ $((SECONDS - started)) -lt "$seconds" ] || return 1
+    sleep "$LIFECYCLE_POLL_INTERVAL" 2>/dev/null || sleep 1
+  done
+}
+
+# Returns 0 only when the group is proven gone, 1 when something is left
+# running or the group could not be checked (SU_WHY).
+su_stop_group() {
+  local pgid=$1 token=$2 grace=$3 owned
+  SU_WHY=""
+  su_members "$pgid"
+  case $? in
+    1) return 0 ;;
+    2)
+      SU_WHY="process group $pgid could not be checked ($SU_UNSURE), so it was not signalled"
+      return 1
+      ;;
+  esac
+  su_group_is_ours "$pgid" "$token"
+  owned=$?
+  if [ "$owned" = 2 ]; then
+    SU_WHY="process group $pgid could not be checked ($SU_UNSURE), so it was not signalled"
+    return 1
+  fi
+  if [ "$owned" != 0 ]; then
+    su_members "$pgid"
+    case $? in
+      1) return 0 ;;
+      2) SU_WHY="process group $pgid could not be checked ($SU_UNSURE), so it was not signalled" ;;
+      *) SU_WHY="process group $pgid is running, but none of its processes holds this stack's launch token, so it is not signalled (PIDs: $SU_MEMBERS; they may belong to an unrelated program that now uses that group ID)" ;;
+    esac
+    return 1
+  fi
+  su_signal_group TERM "$pgid"
+  if su_wait_group_gone "$pgid" "$grace"; then
+    wait "$pgid" 2>/dev/null
+    return 0
+  fi
+  if su_group_is_ours "$pgid" "$token"; then
+    su_signal_group KILL "$pgid"
+    if su_wait_group_gone "$pgid" 3; then
+      wait "$pgid" 2>/dev/null
+      return 0
+    fi
+    SU_WHY="process group $pgid is still running after TERM and KILL (PIDs: ${SU_MEMBERS:-not listed})"
+    return 1
+  fi
+  su_members "$pgid"
+  case $? in
+    1)
+      wait "$pgid" 2>/dev/null
+      return 0
+      ;;
+    2) SU_WHY="process group $pgid did not stop within ${grace}s of TERM and could not be checked again ($SU_UNSURE), so KILL was not sent" ;;
+    *) SU_WHY="process group $pgid did not stop within ${grace}s of TERM, and none of its processes holds this stack's launch token any more, so KILL was not sent (PIDs: $SU_MEMBERS)" ;;
+  esac
+  return 1
+}
+
+# ---------------------------------------------------------------- launch table
+
+SU_L_NAME=(); SU_L_KIND=(); SU_L_PID=(); SU_L_PGID=(); SU_L_TOKEN=(); SU_L_PORT=(); SU_L_LOG=()
+
+su_launched_load() {
+  local name kind pid pgid token port log n
+  SU_L_NAME=(); SU_L_KIND=(); SU_L_PID=(); SU_L_PGID=(); SU_L_TOKEN=(); SU_L_PORT=(); SU_L_LOG=()
+  [ -f "$SU_LAUNCHED" ] || return 0
+  while IFS='|' read -r name kind pid pgid token port log; do
+    # kill -- -0 is the engine's own group and -1 every process the user can
+    # signal, so a hand-edited 0 or 1 is never a record.
+    if ! util_is_uint "${pid:-x}" || ! util_is_uint "${pgid:-x}" || [ "$pid" -le 1 ] || [ "$pgid" -le 1 ]; then
+      continue
+    fi
+    n=${#SU_L_NAME[@]}
+    SU_L_NAME[n]=$name; SU_L_KIND[n]=$kind; SU_L_PID[n]=$pid; SU_L_PGID[n]=$pgid
+    SU_L_TOKEN[n]=$token; SU_L_PORT[n]=$port; SU_L_LOG[n]=$log
+  done < "$SU_LAUNCHED"
+}
+
+su_launched_write() {
+  local i=0 text=""
+  while [ "$i" -lt "${#SU_L_NAME[@]}" ]; do
+    if [ -n "${SU_L_NAME[$i]}" ]; then
+      text="$text${SU_L_NAME[$i]}|${SU_L_KIND[$i]}|${SU_L_PID[$i]}|${SU_L_PGID[$i]}|${SU_L_TOKEN[$i]}|${SU_L_PORT[$i]}|${SU_L_LOG[$i]}$SU_NL"
+    fi
+    i=$((i + 1))
+  done
+  printf '%s' "$text" >| "$SU_LAUNCHED"
+}
+
+# The file is appended before the arrays, so a record the table could not keep
+# is never held in memory either, and the caller stops the launch.
+su_launched_add() {
+  local n=${#SU_L_NAME[@]}
+  { printf '%s|%s|%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$SU_LAUNCHED"; } 2>/dev/null || return 1
+  SU_L_NAME[n]=$1; SU_L_KIND[n]=$2; SU_L_PID[n]=$3; SU_L_PGID[n]=$4
+  SU_L_TOKEN[n]=$5; SU_L_PORT[n]=$6; SU_L_LOG[n]=$7
+}
+
+su_launched_drop() {
+  SU_L_NAME[$1]=""
+  su_launched_write
+}
+
+su_launched_find() {
+  local i=0
+  while [ "$i" -lt "${#SU_L_NAME[@]}" ]; do
+    if [ "${SU_L_NAME[$i]}" = "$1" ]; then
+      SU_I=$i
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Only records of groups proven gone are dropped; a live or undecided group
+# keeps its record so a later --stop still finds it.
+su_launched_prune() {
+  local i=0
+  while [ "$i" -lt "${#SU_L_NAME[@]}" ]; do
+    if [ -n "${SU_L_NAME[$i]}" ]; then
+      su_members "${SU_L_PGID[$i]}"
+      [ "$?" != 1 ] || SU_L_NAME[i]=""
+    fi
+    i=$((i + 1))
+  done
+  su_launched_write
+}
+
+# ---------------------------------------------------------------- child environment
+
+SU_ENVV=()
+
+su_env_value_count() {
+  local i=0 n=0
+  while [ "$i" -lt "${#SU_ENVV[@]}" ]; do
+    case ${SU_ENVV[$i]} in
+      "$1|"*) n=$((n + 1)) ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s\n' "$n"
+}
+
+su_export_provider() {
+  local i=0
+  while [ "$i" -lt "${#SU_ENVV[@]}" ]; do
+    case ${SU_ENVV[$i]} in
+      "$1|"*) export "${SU_ENVV[$i]#*|}" ;;
+    esac
+    i=$((i + 1))
+  done
+}
+
+su_export_env_file() {
+  local file=$1 line key n=0
+  [ -e "$file" ] && [ ! -d "$file" ] && [ -r "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    case $line in
+      ''|'#'*) continue ;;
+      'export '*) line=${line#export }; line=${line#"${line%%[! ]*}"} ;;
+    esac
+    key=${line%%=*}
+    case $line in
+      *=*) ;;
+      *) key="" ;;
+    esac
+    # A malformed line can be part of a value (a password, a key block), so
+    # only its number is named, never its text.
+    if [ -z "$key" ] || ! su_shape_ok envname "$key"; then
+      printf 'stack-up: env_file %s: line %s was skipped, because it does not start with a variable name and =\n' "$file" "$n" >&2
+      continue
+    fi
+    # shellcheck disable=SC2163 # line is a validated KEY=VALUE pair, exported as such
+    export "$line"
+  done < "$file"
+  return 0
+}
+
+# Runs in the forked child only, so provider values, env and env_file never
+# reach the engine's own environment and never appear on a command line.
+su_exec_child() {
+  local i=$1 command=$2 kind name value provider
+  exec 7<&-
+  if [ "$i" -ge 0 ]; then
+    kind=${SU_E_KIND[$i]}
+    name=${SU_E_NAME[$i]}
+    if [ -n "${SU_E_PORT[$i]}" ]; then
+      export PORT="${SU_E_PORT[$i]}"
+      if su_cfg "$kind" "$name" port_env; then
+        export "$SU_V=${SU_E_PORT[$i]}"
+      fi
+    fi
+    if su_cfg "$kind" "$name" env_file; then
+      su_path "$SU_V"
+      su_export_env_file "$SU_X" || printf 'stack-up: env_file %s is not readable\n' "$SU_X" >&2
+    fi
+    if su_cfg_all "$kind" "$name" env; then
+      for value in "${SU_LIST[@]}"; do
+        # shellcheck disable=SC2163 # schema-validated KEY=VALUE
+        export "$value"
+      done
+    fi
+    for provider in ${SU_E_ENVFROM[$i]}; do
+      su_export_provider "$provider"
+    done
+    if [ -n "${SU_E_NODE[$i]:-}" ]; then
+      PATH=${SU_E_NODE[$i]}:$PATH
+      export PATH
+    fi
+    su_entry_dir "$i"
+  else
+    SU_X=$STACK_ROOT
+    for provider in ${SU_EXTRA_PROVIDERS:-}; do
+      su_export_provider "$provider"
+    done
+  fi
+  cd -- "$SU_X" || { printf 'stack-up: cannot enter %s\n' "$SU_X" >&2; exit 126; }
+  exec "$BASH" -c "$command"
+}
+
+su_entry_dir() {
+  if su_cfg "${SU_E_KIND[$1]}" "${SU_E_NAME[$1]}" dir; then
+    su_entry_path "$1" "$SU_V"
+  else
+    SU_X=$STACK_ROOT
+  fi
+}
+
+su_entry_log() {
+  if su_cfg "${SU_E_KIND[$1]}" "${SU_E_NAME[$1]}" log; then
+    su_entry_path "$1" "$SU_V"
+    SU_LOG=$SU_X
+  else
+    SU_LOG=$STACK_LOGS/${SU_E_NAME[$1]}.log
+  fi
+}
+
+# The output redirection happens inside the deadline child, never around the
+# call: a signal trap runs in the caller's redirection context, and an
+# interrupt message written into an entry log would never reach the terminal.
+su_in_log() {
+  local log=$1
+  shift
+  exec >>"$log" 2>&1
+  "$@"
+}
+
+su_errs_to() {
+  local log=$1
+  shift
+  exec 2>>"$log"
+  "$@"
+}
+
+su_run_plain() {
+  local seconds=$1 command=$2 log=$3
+  lifecycle_run_with_deadline "$seconds" su_in_log "$log" su_exec_child -1 "$command"
+}
+
+su_run_entry_command() {
+  local seconds=$1 i=$2 command=$3 log=$4
+  lifecycle_run_with_deadline "$seconds" su_in_log "$log" su_exec_child "$i" "$command"
+}
+
+# ---------------------------------------------------------------- toolchain
+
+su_resolve_nvm() {
+  local i=$1 dir version nvm_dir found
+  SU_NODE_BIN=""
+  su_entry_dir "$i"
+  dir=$SU_X
+  if [ ! -r "$dir/.nvmrc" ]; then
+    SU_WHY="toolchain = nvm, but $dir/.nvmrc is missing"
+    return 1
+  fi
+  read -r version < "$dir/.nvmrc" || version=""
+  version=${version%$'\r'}
+  nvm_dir=${NVM_DIR:-${HOME:-}/.nvm}
+  if [ ! -r "$nvm_dir/nvm.sh" ]; then
+    SU_WHY="toolchain = nvm, but $nvm_dir/nvm.sh is missing (set NVM_DIR or install nvm)"
+    return 1
+  fi
+  # shellcheck disable=SC2016 # the inner shell expands these, not this one
+  found=$(cd "$dir" && NVM_DIR=$nvm_dir "$BASH" -c '. "$NVM_DIR/nvm.sh" --no-use >/dev/null 2>&1 && nvm which "$1" 2>/dev/null' su-nvm "$version" </dev/null 8<&- 9>&- 7<&- | tail -n 1)
+  case $found in
+    /*) SU_NODE_BIN=${found%/*} ;;
+    *)
+      SU_WHY="nvm has no node for $version (from $dir/.nvmrc); run nvm install $version"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------- readiness
+
+su_ready_spec() {
+  local i=$1
+  if su_cfg service "${SU_E_NAME[$i]}" ready; then
+    SU_READY=$SU_V
+  elif [ -n "${SU_E_PORT[$i]}" ]; then
+    SU_READY=port
+  else
+    SU_READY="alive 5"
+  fi
+  local saved_port=${PORT-}
+  PORT=${SU_E_PORT[$i]}
+  # A cmd probe is shell text: a path pasted into it would be evaluated by
+  # bash -c, so only ${PORT} is replaced and bash expands the rest from the
+  # exported variables.
+  case $SU_READY in
+    'cmd '*) SU_X=$(conf_expand "$SU_READY" PORT) ;;
+    *) su_expand "$SU_READY" || true ;;
+  esac
+  SU_READY=$SU_X
+  PORT=$saved_port
+}
+
+su_listener_is_ours() {
+  local port=$1 pgid=$2 pid
+  SU_FOREIGN=""
+  su_listeners "$port" || return 1
+  su_members "$pgid" || return 1
+  local ours=1
+  for pid in $SU_LISTENERS; do
+    if util_contains_word "$pid" "$SU_MEMBERS"; then
+      ours=0
+    else
+      SU_FOREIGN="$SU_FOREIGN $pid"
+    fi
+  done
+  SU_FOREIGN=${SU_FOREIGN# }
+  return "$ours"
+}
+
+# Ready means: the launched leader is still alive on every poll, and the probe
+# passes before the deadline; a port probe only counts a listener inside the
+# launched process group. Probes are local, so curl runs with -q (no curlrc)
+# and --noproxy '*': a proxy would otherwise answer for, or fail, this machine.
+su_wait_ready() {
+  local i=$1 pid=$2 pgid=$3 timeout=$4 started=$SECONDS port kind rest url status code words passed
+  port=${SU_E_PORT[$i]}
+  su_ready_spec "$i"
+  SU_WHY=""
+  kind=${SU_READY%% *}
+  rest=""
+  case $SU_READY in
+    *' '*) rest=${SU_READY#* } ;;
+  esac
+  while :; do
+    if ! su_alive "$pid"; then
+      SU_WHY="it exited after $((SECONDS - started))s, before it was ready"
+      return 1
+    fi
+    passed=0
+    case $kind in
+      port)
+        su_listener_is_ours "$port" "$pgid" && passed=1
+        ;;
+      http)
+        read -r -a words <<<"$rest"
+        url=${words[0]}
+        status=${words[1]:-200}
+        if [ -z "$port" ] || su_listener_is_ours "$port" "$pgid"; then
+          code=$(curl -q -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 2 "$url" 2>/dev/null)
+          [ "$code" != "$status" ] || passed=1
+        fi
+        ;;
+      cmd)
+        su_run_entry_command 10 "$i" "$rest" /dev/null && passed=1
+        ;;
+      alive)
+        [ $((SECONDS - started)) -lt "$rest" ] || passed=1
+        ;;
+    esac
+    # A probe can start before the deadline and pass after it (a cmd probe
+    # may run for 10 s), and a pass that late does not count.
+    if [ "$passed" = 1 ] && [ $((SECONDS - started)) -le "$timeout" ]; then
+      return 0
+    fi
+    if [ $((SECONDS - started)) -ge "$timeout" ]; then
+      SU_WHY="not ready within ${timeout}s (ready = $SU_READY)"
+      if [ -n "$port" ] && su_listeners "$port"; then
+        su_listener_is_ours "$port" "$pgid" || true
+        if [ -n "$SU_FOREIGN" ]; then
+          SU_WHY="$SU_WHY; port $port is answered by PID $(su_describe_pid "${SU_FOREIGN%% *}"), which is not part of the process group stack-up started"
+        fi
+      fi
+      return 1
+    fi
+    sleep "$LIFECYCLE_POLL_INTERVAL" 2>/dev/null || sleep 1
+  done
+}
+
+su_lan_note() {
+  local i=$1 port=${SU_E_PORT[$1]}
+  [ -n "$port" ] || return 0
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | LC_ALL=C grep -E "[*]:$port |\\[::\\]:$port " >/dev/null; then
+    report_warning "${SU_E_NAME[$i]} listens on all interfaces (*:$port); other machines on the network can reach it"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- outcomes
+
+SU_FAILED=""
+SU_DEGRADED=""
+SU_DEFECTS=""
+SU_SMOKE_FAILED=0
+SU_SMOKE_STATE=none
+SU_ADVISORY=0
+SU_COMPOSE_UP_RAN=0
+
+# %q under the C locale writes $'\ooo' escapes, so a printed command stays
+# ASCII and pastes back as the same path whatever the terminal's locale.
+su_quote() {
+  local LC_ALL=C
+  printf '%q' "$1"
+}
+
+# A relative or ${STACK_ROOT}-based state_dir, log_dir or compose_files
+# resolves against the root, so a run given --root prints a stop command that
+# carries it.
+su_stop_command() {
+  local command
+  command="$SU_SELF --config $(su_quote "$SU_CONFIG_ABS")"
+  [ -z "$SU_ROOT_OVERRIDE" ] || command="$command --root $(su_quote "$STACK_ROOT")"
+  printf '%s --stop' "$command"
+}
+
+# A start that stops early leaves what it already launched running and
+# recorded, so the stop command is printed here as the summary would print it.
+su_abort_stop_hint() {
+  local i=0 names=""
+  while [ "$i" -lt "${#SU_L_NAME[@]}" ]; do
+    [ -z "${SU_L_NAME[$i]}" ] || names="$names ${SU_L_NAME[$i]}"
+    i=$((i + 1))
+  done
+  [ -n "$names" ] || [ "$SU_COMPOSE_UP_RAN" = 1 ] || return 0
+  [ -z "$names" ] || printf '  Still recorded as started by this stack:%s\n' "$names"
+  [ "$SU_COMPOSE_UP_RAN" = 0 ] || printf '  Compose services this run started may still be running.\n'
+  printf '  %sStop it with%s  %s\n\n' "$TERM_COLOR_MUTED" "$TERM_COLOR_RESET" "$(su_stop_command)"
+}
+
+su_mark() {
+  SU_E_STATE[$1]=$2
+}
+
+# warn makes the entry degraded and anything else counts it failed; abort is
+# applied afterwards by su_after_failure, so the WHO and WHAT lines print
+# before the run stops.
+su_entry_failed() {
+  local i=$1 message=$2 name=${SU_E_NAME[$1]}
+  case ${SU_E_ONFAIL[$i]} in
+    warn)
+      report_warning "$message"
+      su_mark "$i" degraded
+      SU_DEGRADED="$SU_DEGRADED $name"
+      ;;
+    *)
+      report_failure "$message" "$name"
+      su_mark "$i" failed
+      SU_FAILED="$SU_FAILED $name"
+      ;;
+  esac
+}
+
+su_after_failure() {
+  local i=$1
+  if [ "${SU_E_ONFAIL[$i]}" = abort ]; then
+    lifecycle_abort "${SU_E_NAME[$i]} failed and its on_fail is abort, so nothing after it runs"
+  fi
+}
+
+su_fail_with_log() {
+  local i=$1 message=$2 log=$3
+  su_entry_failed "$i" "$message"
+  su_fault_from_log "$log" "${SU_E_KIND[$i]}"
+  su_after_failure "$i"
+}
+
+su_fail_with_owner() {
+  local i=$1 message=$2 owner=$3 why=$4 log=${5:-}
+  su_entry_failed "$i" "$message"
+  su_fault "$owner" "$why" "$log"
+  su_after_failure "$i"
+}
+
+su_outcome() {
+  local failures=$1 degraded=$2
+  if [ "$failures" -gt 0 ]; then
+    SU_OUTCOME=partial; SU_EXIT=1
+  elif [ "$degraded" -gt 0 ]; then
+    SU_OUTCOME=degraded; SU_EXIT=3
+  else
+    SU_OUTCOME=open; SU_EXIT=0
+  fi
+}
+
+su_count_words() {
+  local n=0 word
+  for word in $1; do
+    n=$((n + 1))
+  done
+  printf '%s\n' "$n"
+}
+
+su_join() {
+  local out="" word
+  for word in $1; do
+    out=${out:+$out,}$word
+  done
+  printf '%s\n' "$out"
+}
+
+# ---------------------------------------------------------------- entry runners
+
+su_entry_blocked() {
+  local i=$1 dep c=0
+  SU_WHY=""
+  for dep in ${SU_E_DEPS[$i]}; do
+    su_entry_index "$dep" || continue
+    case ${SU_E_STATE[$SU_I]} in
+      ok|skipped-run-if) ;;
+      *)
+        SU_WHY="it depends on $dep, which is ${SU_E_STATE[$SU_I]}"
+        return 0
+        ;;
+    esac
+  done
+  while [ "$c" -lt "${#SU_C_NAME[@]}" ]; do
+    if [ "${SU_C_LEVEL[$c]}" = required ] && { [ "${SU_C_DEP[$c]}" = "${SU_E_NAME[$i]}" ] || [ "${SU_C_DEP[$c]}" = all ]; }; then
+      case ${SU_C_STATE[$c]} in
+        failed|not-checked)
+          SU_WHY="required check ${SU_C_NAME[$c]} is unmet"
+          return 0
+          ;;
+      esac
+    fi
+    c=$((c + 1))
+  done
+  return 1
+}
+
+# A command started without its env_file would fall back to its program's
+# own defaults, such as another database, and the run would still end open.
+su_env_file_ok() {
+  local i=$1 kind=${SU_E_KIND[$1]} name=${SU_E_NAME[$1]}
+  su_env_file_readable "$i" && return 0
+  su_fail_with_owner "$i" "$name not started: its env_file $SU_X cannot be read" local-config "make $SU_X a readable file, or remove env_file from [$kind $name]"
+  return 1
+}
+
+# A folder reads as nothing, so it counts as unreadable; the resolved path is
+# left in SU_X for the caller's message.
+su_env_file_readable() {
+  su_cfg "${SU_E_KIND[$1]}" "${SU_E_NAME[$1]}" env_file || return 0
+  su_entry_path "$1" "$SU_V" || return 1
+  [ -e "$SU_X" ] && [ ! -d "$SU_X" ] && [ -r "$SU_X" ]
+}
+
+su_pre_start() {
+  local i=$1 kind=${SU_E_KIND[$1]} name=${SU_E_NAME[$1]} path hint
+  if su_cfg_all "$kind" "$name" needs; then
+    for path in "${SU_LIST[@]}"; do
+      su_entry_path "$i" "$path"
+      if [ ! -e "$SU_X" ]; then
+        su_cfg "$kind" "$name" needs_hint "create $SU_X, then run again"
+        hint=$SU_V
+        su_fail_with_owner "$i" "$name not started: $SU_X is missing" this-machine "$hint"
+        return 1
+      fi
+    done
+  fi
+  su_env_file_ok "$i" || return 1
+  if su_cfg "$kind" "$name" precheck; then
+    if ! su_run_entry_command 30 "$i" "$SU_V" /dev/null; then
+      su_cfg "$kind" "$name" precheck_hint "the precheck for $name did not pass"
+      hint=$SU_V
+      su_fail_with_owner "$i" "$name not started: its precheck failed" this-machine "$hint"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+su_known_defect() {
+  local i=$1 kind=${SU_E_KIND[$1]} name=${SU_E_NAME[$1]} text
+  if su_cfg "$kind" "$name" known_defect; then
+    text=$SU_V
+  elif su_cfg "$kind" "$name" known_defect_check; then
+    # Without its env_file the check would answer for other values; the
+    # start that follows fails the entry and names the file instead.
+    su_env_file_readable "$i" || return 1
+    su_cfg "$kind" "$name" known_defect_check
+    su_run_entry_command 30 "$i" "$SU_V" /dev/null || return 1
+    text="known_defect_check reported a defect"
+  else
+    return 1
+  fi
+  report_known_defect "$name skipped: $text"
+  su_mark "$i" defect
+  SU_DEFECTS="$SU_DEFECTS $name"
+  return 0
+}
+
+su_log_header() {
+  local log=$1 what=$2 dir=$3
+  mkdir -p -- "${log%/*}" 2>/dev/null
+  printf '=== stack-up %s  %s  dir %s  at %s\n' "$SU_RUN_ID" "$what" "$dir" "$(date '+%Y-%m-%d %H:%M:%S')" >| "$log"
+}
+
+# stack-up writes its own lines into entry logs: the header, which quotes the
+# command and its folder, a service's pid line, and a build log's run markers.
+# Markers, heals and signatures must see only what the entry printed, and in a
+# build log, which every run appends to, only this run's part. The file is read
+# twice, once to find this run's marker, so a long log costs linear time.
+su_entry_output() {
+  LC_ALL=C awk -v mark="--- run $SU_RUN_ID  " '
+    NR == FNR { if (index($0, mark) == 1) start = FNR; next }
+    FNR <= start { next }
+    FNR == 1 && /^=== stack-up / { next }
+    /^pid [0-9]+ pgid [0-9]+$/ { next }
+    { print }
+  ' "$1" "$1" 2>/dev/null
+}
+
+su_run_env_entry() {
+  local i=$1 name=${SU_E_NAME[$1]} run timeout output status line n=0 keys=""
+  su_pre_start "$i" || return 1
+  su_cfg env "$name" run ""; run=$SU_V
+  su_cfg env "$name" timeout 60; timeout=$SU_V
+  su_entry_log "$i"
+  su_log_header "$SU_LOG" "env provider $name" "$STACK_ROOT"
+  output=$(lifecycle_run_with_deadline "$timeout" su_errs_to "$SU_LOG" su_exec_child "$i" "$run")
+  status=$?
+  if [ "$status" != 0 ]; then
+    [ "$status" != 124 ] || status="124, past its ${timeout}s deadline"
+    su_entry_failed "$i" "env provider $name failed (exit $status); refusing to start consumers with placeholder values"
+    su_fault_from_log "$SU_LOG" env
+    su_after_failure "$i"
+    return 1
+  fi
+  # Read through a pipe: a here-document would need a temporary file, and one
+  # that cannot be written would read as no output at all.
+  while IFS= read -r line; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    [ -n "$line" ] || continue
+    su_shape_ok envname "${line%%=*}" || line=""
+    case $line in
+      *=*) ;;
+      *)
+        su_entry_failed "$i" "env provider $name printed line $n, which is not KEY=VALUE; refusing to start its consumers"
+        su_fault local-config "a provider must print only KEY=VALUE lines" "$SU_LOG"
+        su_after_failure "$i"
+        return 1
+        ;;
+    esac
+    SU_ENVV[${#SU_ENVV[@]}]="$name|$line"
+    keys="$keys ${line%%=*}=<set>"
+  done < <(printf '%s\n' "$output")
+  output=""
+  report_success "env provider $name:${keys:- no values}"
+  su_mark "$i" ok
+  return 0
+}
+
+su_run_job_entry() {
+  local i=$1 name=${SU_E_NAME[$1]} run timeout status started marker reason detail line
+  su_cfg job "$name" run ""; run=$SU_V
+  su_cfg job "$name" timeout 600; timeout=$SU_V
+  su_entry_log "$i"
+  su_entry_dir "$i"
+  if su_cfg job "$name" run_if; then
+    su_run_entry_command 60 "$i" "$SU_V" /dev/null
+    status=$?
+    case $status in
+      0) ;;
+      1)
+        report_skipped "$name: not needed (run_if said no)"
+        su_mark "$i" skipped-run-if
+        return 0
+        ;;
+      *)
+        su_fail_with_owner "$i" "$name: its run_if probe failed (exit $status)" local-config "run_if must exit 0 (run) or 1 (skip); anything else is an error"
+        return 1
+        ;;
+    esac
+  fi
+  su_log_header "$SU_LOG" "job $name: $run" "$SU_X"
+  started=$SECONDS
+  su_run_entry_command "$timeout" "$i" "$run" "$SU_LOG"
+  status=$?
+  SU_E_DUR[i]=$((SECONDS - started))
+  reason=""
+  if su_cfg job "$name" reason_marker; then
+    reason=$(su_entry_output "$SU_LOG" | LC_ALL=C grep -E -e "$SU_V" 2>/dev/null | head -n 1 | cut -c 1-160)
+  fi
+  marker=""
+  if [ "$status" = 124 ]; then
+    marker="stopped at its ${timeout}s deadline"
+  else
+    su_cfg job "$name" trust_exit yes
+    if [ "$SU_V" = yes ] && [ "$status" != 0 ]; then
+      marker="exited $status"
+    fi
+    if [ -z "$marker" ] && su_cfg job "$name" fail_marker && su_entry_output "$SU_LOG" | LC_ALL=C grep -E -e "$SU_V" >/dev/null 2>&1; then
+      marker="its log matches fail_marker"
+    fi
+    if [ -z "$marker" ] && su_cfg job "$name" ok_marker && ! su_entry_output "$SU_LOG" | LC_ALL=C grep -E -e "$SU_V" >/dev/null 2>&1; then
+      marker="its log does not contain ok_marker"
+    fi
+  fi
+  if [ -n "$marker" ]; then
+    if su_cfg job "$name" fail_detail; then
+      detail=$(su_entry_output "$SU_LOG" | LC_ALL=C grep -E -e "$SU_V" 2>/dev/null | LC_ALL=C sort -u | head -n 5)
+      while IFS= read -r line; do
+        [ -z "$line" ] || report_warning "$name: $(printf '%s' "$line" | cut -c 1-160)"
+      done <<EOF
+$detail
+EOF
+    fi
+    su_fail_with_log "$i" "job $name failed: $marker${reason:+: $reason}" "$SU_LOG"
+    return 1
+  fi
+  report_success "job $name finished ($(report_duration "${SU_E_DUR[$i]}"))"
+  su_mark "$i" ok
+  if su_cfg job "$name" report; then
+    line=$(lifecycle_run_with_deadline 60 su_errs_to /dev/null su_exec_child "$i" "$SU_V" | head -n 1)
+    if [ -n "$line" ]; then
+      report_detail "$name: $line"
+    else
+      report_detail "$name: its report printed nothing"
+    fi
+  fi
+  return 0
+}
+
+# The -f flags go before the subcommand, as compose requires. Each file is one
+# argument, so a project folder with a space in its path still works. Compose
+# resolves a missing -f, and relative paths inside compose files, from its
+# current folder; every call runs in a deadline child, so this cd is that
+# child's alone.
+su_compose_args() {
+  local -a words
+  local k=0
+  cd -- "$STACK_ROOT" || return 1
+  read -r -a words <<<"$SU_COMPOSE_CMD"
+  local -a args
+  args=("${words[@]}" -p "$SU_NAME")
+  while [ "$k" -lt "${#SU_COMPOSE_FILES[@]}" ]; do
+    args[${#args[@]}]=-f
+    args[${#args[@]}]=${SU_COMPOSE_FILES[$k]}
+    k=$((k + 1))
+  done
+  "${args[@]}" "$@"
+}
+
+su_engine_up() {
+  su_cfg stack "" engine_check "docker info"
+  su_run_plain 30 "$SU_V" /dev/null
+}
+
+su_ensure_engine() {
+  local timeout started
+  su_engine_up && { report_success "container engine is running"; return 0; }
+  su_cfg stack "" engine_start ""
+  if [ -z "$SU_V" ]; then
+    lifecycle_abort "the container engine is not running and [stack] engine_start is empty; start it yourself, then run again"
+  fi
+  report_detail "starting the container engine: $SU_V"
+  su_run_plain 60 "$SU_V" /dev/null || true
+  su_cfg stack "" engine_timeout 240; timeout=$SU_V
+  started=$SECONDS
+  while ! su_engine_up; do
+    if [ $((SECONDS - started)) -ge "$timeout" ]; then
+      lifecycle_abort "the container engine did not come up within ${timeout}s"
+    fi
+    sleep 2
+  done
+  report_success "container engine is running ($(report_duration $((SECONDS - started))))"
+}
+
+su_compose_states() {
+  lifecycle_run_with_deadline 30 su_errs_to /dev/null su_compose_args ps --all --format '{{.Service}}|{{.State}}|{{.Health}}' "$@"
+}
+
+su_run_compose_entry() {
+  local i=$1 name=${SU_E_NAME[$1]} services ready timeout started status states svc line state health pending
+  su_cfg compose "$name" services ""; services=$SU_V
+  su_cfg compose "$name" ready healthy; ready=$SU_V
+  su_cfg compose "$name" ready_timeout 180; timeout=$SU_V
+  su_entry_log "$i"
+  su_log_header "$SU_LOG" "compose $name: up -d $services" "$STACK_ROOT"
+  SU_COMPOSE_UP_RAN=1
+  # shellcheck disable=SC2086 # services is a validated list of plain names
+  lifecycle_run_with_deadline 600 su_in_log "$SU_LOG" su_compose_args up -d $services
+  status=$?
+  if [ "$status" != 0 ]; then
+    su_fail_with_log "$i" "compose $name: up failed (exit $status)" "$SU_LOG"
+    return 1
+  fi
+  started=$SECONDS
+  while :; do
+    # shellcheck disable=SC2086 # services is a validated list of plain names
+    states=$(su_compose_states $services)
+    pending=""
+    for svc in $services; do
+      line=$(printf '%s\n' "$states" | LC_ALL=C grep -E "^$svc\\|" | head -n 1)
+      state=$(printf '%s' "$line" | cut -d'|' -f2)
+      health=$(printf '%s' "$line" | cut -d'|' -f3)
+      if [ -z "$line" ]; then
+        pending="$pending $svc (not created)"
+      elif [ "$state" != running ]; then
+        pending="$pending $svc ($state)"
+      elif [ "$ready" = healthy ] && [ -n "$health" ] && [ "$health" != healthy ]; then
+        pending="$pending $svc ($health)"
+      fi
+    done
+    [ -n "$pending" ] || break
+    if [ $((SECONDS - started)) -ge "$timeout" ]; then
+      su_fail_with_log "$i" "compose $name: not ready within ${timeout}s:$pending" "$SU_LOG"
+      return 1
+    fi
+    sleep 2
+  done
+  report_success "compose $name: $services ready ($(report_duration $((SECONDS - started))))"
+  su_mark "$i" ok
+  return 0
+}
+
+su_new_token() {
+  local name=$1
+  mkdir -p -- "$SU_TOKENS" || return 1
+  SU_TOKEN=$SU_TOKENS/$name-$SU_RUN_ID
+  printf 'launch token for %s, run %s\n' "$name" "$SU_RUN_ID" >| "$SU_TOKEN"
+}
+
+# set -m gives the child a process group of its own, which is what --stop later
+# signals; descriptors 8 and 9 are closed so the child can neither read the
+# answer device nor hold the run lock, and the launch token stays open on 19 as
+# the proof that the group is this stack's.
+su_launch() {
+  local i=$1 command=$2 log=$3 monitor_was_on=0
+  case $- in
+    *m*) monitor_was_on=1 ;;
+  esac
+  set -m
+  SU_JOB_CONTROL=0
+  case $- in
+    *m*) SU_JOB_CONTROL=1 ;;
+  esac
+  su_exec_child "$i" "$command" </dev/null >>"$log" 2>&1 8<&- 9>&- 19<"$SU_TOKEN" &
+  SU_PID=$!
+  [ "$monitor_was_on" = 1 ] || set +m
+}
+
+su_launch_service() {
+  local i=$1 name=${SU_E_NAME[$1]} start
+  su_cfg service "$name" start ""; start=$SU_V
+  su_entry_log "$i"
+  su_entry_dir "$i"
+  if [ ! -d "$SU_X" ]; then
+    su_fail_with_owner "$i" "$name not started: its dir $SU_X does not exist" local-config "fix dir in [service $name]"
+    return 1
+  fi
+  su_log_header "$SU_LOG" "start $start" "$SU_X"
+  if ! su_new_token "$name"; then
+    su_fail_with_owner "$i" "$name not started: cannot write its launch token under $SU_TOKENS" this-machine "the state folder must be writable"
+    return 1
+  fi
+  su_launch "$i" "$start" "$SU_LOG"
+  if ! su_leads_group "$SU_PID" && su_alive "$SU_PID"; then
+    su_signal_launch TERM "$SU_PID"
+    if [ "$SU_JOB_CONTROL" = 1 ]; then
+      su_fail_with_owner "$i" "$name not started: the system did not report its process group $SU_PID within a second of the launch, so it was stopped at once" needs-a-look "run again; if this repeats, this bash cannot give a background job its own process group"
+    else
+      su_fail_with_owner "$i" "$name not started: it could not be given its own process group, so it was stopped at once" this-machine "job control (set -m) is not available in this shell"
+    fi
+    return 1
+  fi
+  if ! su_launched_add "$name" service "$SU_PID" "$SU_PID" "$SU_TOKEN" "${SU_E_PORT[$i]}" "$SU_LOG"; then
+    # The child was launched a moment ago by this run. Its token may not be
+    # open yet, so its group is signalled only while the kernel still has
+    # it; a group already gone means the launch exited and gets no signal.
+    if ! su_group_exists "$SU_PID"; then
+      wait "$SU_PID" 2>/dev/null
+      if su_token_strays "$SU_TOKEN" ""; then
+        report_warning "$name: $SU_STRAYS left the process group stack-up started but still holds its launch token, so it was not signalled; stop it by hand"
+      fi
+      su_fail_with_owner "$i" "$name not started: its launch could not be recorded in $SU_LAUNCHED, and it had already exited" this-machine "the state folder must be writable"
+      return 1
+    fi
+    su_signal_group TERM "$SU_PID"
+    if su_wait_group_gone "$SU_PID" 5 || { ! su_group_exists "$SU_PID" || su_signal_group KILL "$SU_PID"; su_wait_group_gone "$SU_PID" 3; }; then
+      wait "$SU_PID" 2>/dev/null
+      if su_token_strays "$SU_TOKEN" ""; then
+        report_warning "$name: $SU_STRAYS left the process group stack-up started but still holds its launch token, so it was not signalled; stop it by hand"
+      fi
+      su_fail_with_owner "$i" "$name not started: its launch could not be recorded in $SU_LAUNCHED, so it was stopped at once" this-machine "the state folder must be writable"
+    else
+      su_fail_with_owner "$i" "$name not started: its launch could not be recorded in $SU_LAUNCHED, and process group $SU_PID did not stop after TERM and KILL; stop it by hand" this-machine "the state folder must be writable"
+    fi
+    return 1
+  fi
+  printf 'pid %s pgid %s\n' "$SU_PID" "$SU_PID" >> "$SU_LOG"
+  SU_E_PID[i]=$SU_PID
+  return 0
+}
+
+su_stop_recorded() {
+  local name=$1 grace=${2:-10}
+  su_launched_find "$name" || return 0
+  local k=$SU_I
+  if su_stop_group "${SU_L_PGID[$k]}" "${SU_L_TOKEN[$k]}" "$grace"; then
+    su_launched_drop "$k"
+    return 0
+  fi
+  return 1
+}
+
+su_heal_for() {
+  local i=$1 name=${SU_E_NAME[$1]} heal
+  SU_HEAL=""
+  for heal in $(conf_names heal); do
+    su_cfg heal "$heal" for ""
+    util_contains_word "$name" "$SU_V" || continue
+    if su_cfg heal "$heal" when_log; then
+      su_entry_log "$i"
+      su_entry_output "$SU_LOG" | LC_ALL=C grep -E -e "$SU_V" >/dev/null 2>&1 || continue
+    else
+      su_cfg heal "$heal" when ""
+      SU_EXTRA_PROVIDERS=""
+      su_run_plain 30 "$SU_V" /dev/null || continue
+    fi
+    SU_HEAL=$heal
+    return 0
+  done
+  return 1
+}
+
+su_run_heal() {
+  local heal=$1 name=$2 timeout settle status
+  su_cfg heal "$heal" timeout 60; timeout=$SU_V
+  su_cfg heal "$heal" settle 0; settle=$SU_V
+  su_cfg heal "$heal" env_from ""
+  SU_EXTRA_PROVIDERS=$SU_V
+  su_cfg heal "$heal" run ""
+  report_detail "$name: trying heal $heal once"
+  su_run_plain "$timeout" "$SU_V" "$STACK_LOGS/heal-$heal.log"
+  status=$?
+  SU_EXTRA_PROVIDERS=""
+  printf '%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$heal" "$name" "exit=$status" >> "$SU_HEALS"
+  if [ "$settle" -gt 0 ]; then
+    sleep "$settle"
+  fi
+  return "$status"
+}
+
+su_start_service() {
+  local i=$1 name=${SU_E_NAME[$1]} build timeout status
+  # Checked before a running copy is stopped, so a missing file never takes
+  # down a copy that works.
+  if ! su_env_file_ok "$i"; then
+    ! su_launched_find "$name" || report_detail "$name: the copy an earlier run started was not stopped"
+    return 1
+  fi
+  if su_launched_find "$name"; then
+    report_detail "$name: stopping the copy this stack started earlier"
+    if ! su_stop_recorded "$name" "$(su_stop_timeout "$i")"; then
+      su_fail_with_owner "$i" "$name not restarted: $SU_WHY" needs-a-look "if those PIDs are this stack's, stop them by hand; if not, delete the $name line from $SU_LAUNCHED; then run again"
+      return 1
+    fi
+  fi
+  su_pre_start "$i" || return 1
+  SU_E_NODE[i]=""
+  su_cfg service "$name" toolchain none
+  if [ "$SU_V" = nvm ]; then
+    if ! su_resolve_nvm "$i"; then
+      su_fail_with_owner "$i" "$name not started: $SU_WHY" this-machine "install the node version named in .nvmrc with nvm"
+      return 1
+    fi
+    SU_E_NODE[i]=$SU_NODE_BIN
+  fi
+  if su_cfg service "$name" build; then
+    build=$SU_V
+    su_cfg service "$name" build_timeout 900; timeout=$SU_V
+    local build_log=$STACK_LOGS/$name.build.log
+    printf -- '--- run %s  %s ---\n' "$SU_RUN_ID" "$build" >> "$build_log"
+    su_run_entry_command "$timeout" "$i" "$build" "$build_log"
+    status=$?
+    if [ "$status" != 0 ]; then
+      [ "$status" != 124 ] || status="124, past its ${timeout}s deadline"
+      su_fail_with_log "$i" "$name: build failed (exit $status), so it was not started" "$build_log"
+      return 1
+    fi
+    report_detail "$name: built"
+  fi
+  su_launch_service "$i" || return 1
+  return 0
+}
+
+su_stop_timeout() {
+  su_cfg service "${SU_E_NAME[$1]}" stop_timeout 10
+  printf '%s\n' "$SU_V"
+}
+
+su_await_service() {
+  local i=$1 name=${SU_E_NAME[$1]} timeout pid started where heal
+  su_cfg service "$name" ready_timeout 60; timeout=$SU_V
+  pid=${SU_E_PID[$i]}
+  started=$SECONDS
+  if su_wait_ready "$i" "$pid" "$pid" "$timeout"; then
+    su_service_ok "$i" "$started" ""
+    return 0
+  fi
+  local why=$SU_WHY stopped=1
+  su_entry_log "$i"
+  local log=$SU_LOG
+  if ! su_stop_recorded "$name" "$(su_stop_timeout "$i")"; then
+    report_warning "$name: $SU_WHY"
+    stopped=0
+  fi
+  su_note_strays "$i"
+  # A second copy is never launched while the first may still be running.
+  if [ "$stopped" = 1 ] && [ "${SU_E_HEALED[$i]:-0}" = 0 ] && su_heal_for "$i"; then
+    heal=$SU_HEAL
+    SU_E_HEALED[i]=1
+    report_warning "$name failed to start ($why); its log matches heal $heal"
+    if su_run_heal "$heal" "$name"; then
+      # A relaunch that cannot start has already counted and explained its
+      # own failure, so it must not be counted a second time below.
+      if ! su_launch_service "$i"; then
+        printf '%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$heal" "$name" "not recovered" >> "$SU_HEALS"
+        return 1
+      fi
+      pid=${SU_E_PID[$i]}
+      started=$SECONDS
+      if su_wait_ready "$i" "$pid" "$pid" "$timeout"; then
+        printf '%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$heal" "$name" recovered >> "$SU_HEALS"
+        su_service_ok "$i" "$started" " (recovered after heal $heal)"
+        return 0
+      fi
+      why=$SU_WHY
+      su_stop_recorded "$name" "$(su_stop_timeout "$i")" || report_warning "$name: $SU_WHY"
+      su_note_strays "$i"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$heal" "$name" "not recovered" >> "$SU_HEALS"
+  fi
+  su_fail_with_log "$i" "$name failed to start: $why" "$log"
+  return 1
+}
+
+su_note_strays() {
+  local i=$1 name=${SU_E_NAME[$1]}
+  su_token_strays "$SU_TOKENS/$name-$SU_RUN_ID" "${SU_E_PID[$i]:-}" || return 0
+  report_warning "$name: $SU_STRAYS left the process group stack-up started but still holds its launch token, so it was not signalled; stop it by hand"
+}
+
+# A service that passed its probe can still exit before the run ends; only a
+# service whose process group is still there counts as running.
+su_recheck_services() {
+  local i=0 name
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    if [ "${SU_E_STATE[$i]}" = ok ] && [ "${SU_E_KIND[$i]}" = service ] && [ -n "${SU_E_PID[$i]:-}" ]; then
+      name=${SU_E_NAME[$i]}
+      su_members "${SU_E_PID[$i]}"
+      case $? in
+        1)
+          su_entry_log "$i"
+          su_entry_failed "$i" "$name exited after it was ready"
+          su_fault_from_log "$SU_LOG" service
+          su_note_strays "$i"
+          ;;
+        2) report_warning "$name: could not check that it is still running ($SU_UNSURE)" ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+}
+
+# The port is shown only when readiness proved a listener in the group on it.
+su_service_ok() {
+  local i=$1 started=$2 note=$3 where=running
+  su_ready_spec "$i"
+  case $SU_READY in
+    port|'http '*) [ -z "${SU_E_PORT[$i]}" ] || where=":${SU_E_PORT[$i]}" ;;
+  esac
+  SU_E_DUR[i]=$((SECONDS - started))
+  report_success "${SU_E_NAME[$i]} ready $where ($(report_duration "${SU_E_DUR[$i]}"))$note"
+  su_mark "$i" ok
+  su_lan_note "$i"
+}
+
+# ---------------------------------------------------------------- checks
+
+# A gate runs whenever a check it gates runs, or that check would be marked
+# not checked for a gate that never ran. Gates are declared above the checks
+# they gate, so the recursion ends.
+su_check_needed() {
+  local c=$1 dep=${SU_C_DEP[$1]} i=0 k
+  k=$((c + 1))
+  while [ "$k" -lt "${#SU_C_NAME[@]}" ]; do
+    if [ "${SU_C_GATE[$k]}" = "${SU_C_NAME[$c]}" ] && su_check_needed "$k"; then
+      return 0
+    fi
+    k=$((k + 1))
+  done
+  if [ "$dep" = all ]; then
+    while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+      [ "${SU_E_SEL[$i]}" != 1 ] || return 0
+      i=$((i + 1))
+    done
+    return 1
+  fi
+  su_entry_index "$dep" && [ "${SU_E_SEL[$SU_I]}" = 1 ]
+}
+
+su_backup_name() {
+  local check=$1 stamp n=0
+  stamp=$(date +%s)
+  SU_BACKUP=$SU_BACKUPS/$check-$stamp.bak
+  while [ -e "$SU_BACKUP" ]; do
+    n=$((n + 1))
+    SU_BACKUP=$SU_BACKUPS/$check-$stamp-$n.bak
+  done
+}
+
+# verify -> backup -> repair -> verify. Nothing is written to a target that
+# has not first been copied (target) or backed up by a command (backup).
+su_run_check() {
+  local c=$1 name=${SU_C_NAME[$1]} probe level consequence repair target="" backup_cmd status gate
+  level=${SU_C_LEVEL[$c]}
+  su_cfg check "$name" probe ""; probe=$SU_V
+  su_cfg check "$name" consequence ""; consequence=$SU_V
+  gate=${SU_C_GATE[$c]}
+  if [ -n "$gate" ] && su_check_index "$gate"; then
+    case ${SU_C_STATE[$SU_I]} in
+      ok|repaired) ;;
+      *)
+        SU_C_STATE[c]=not-checked
+        report_skipped "check $name not checked: its gate $gate did not pass"
+        return 0
+        ;;
+    esac
+  fi
+  if su_run_plain 60 "$probe" /dev/null; then
+    SU_C_STATE[c]=ok
+    report_success "check $name: satisfied"
+    return 0
+  fi
+  if [ "$level" = advisory ]; then
+    SU_C_STATE[c]=advisory
+    SU_ADVISORY=$((SU_ADVISORY + 1))
+    report_detail "check $name (advisory) is unmet${consequence:+: $consequence}"
+    return 0
+  fi
+  if ! su_cfg check "$name" repair; then
+    su_check_failed "$c" "check $name is unmet and has no repair${consequence:+: $consequence}"
+    return 0
+  fi
+  repair=$SU_V
+  su_cfg stack "" repair auto
+  local policy=$SU_V
+  [ "$SU_NO_REPAIR" = 0 ] || policy=never
+  case $policy in
+    never)
+      su_check_failed "$c" "check $name is unmet; repair is off${consequence:+: $consequence}"
+      return 0
+      ;;
+    ask)
+      su_ask_yes_no "Repair check $name now? A backup is taken first." no
+      if [ "$SU_ANSWER" != yes ]; then
+        su_check_failed "$c" "check $name is unmet; the repair was declined${consequence:+: $consequence}"
+        return 0
+      fi
+      ;;
+  esac
+  report_detail "check $name: missing, repairing"
+  # Every repair is audited, so one whose log cannot be written does not run.
+  # Once this first line is in, a later write that fails means the disk
+  # changed during the run, and those writes stay unchecked.
+  if ! { printf '=== %s check %s\nrepair: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$name" "$repair" >> "$SU_REPAIR_LOG"; } 2>/dev/null; then
+    su_check_failed "$c" "check $name: its repair log $SU_REPAIR_LOG cannot be written, so the repair was not attempted"
+    return 0
+  fi
+  SU_BACKUP=""
+  if su_cfg check "$name" target; then
+    su_path "$SU_V"
+    target=$SU_X
+    if [ -e "$target" ]; then
+      mkdir -p -- "$SU_BACKUPS" && chmod 700 "$SU_BACKUPS"
+      su_backup_name "$name"
+      if ! ( umask 077; cp -p -- "$target" "$SU_BACKUP" ) || ! chmod 600 "$SU_BACKUP"; then
+        printf 'result: FAILED, could not copy %s to %s; the repair was not attempted\n' "$target" "$SU_BACKUP" >> "$SU_REPAIR_LOG"
+        su_check_failed "$c" "check $name: the backup of $target failed, so the repair was not attempted"
+        return 0
+      fi
+      printf 'backup: %s\n' "$SU_BACKUP" >> "$SU_REPAIR_LOG"
+    else
+      printf 'backup: %s did not exist, nothing to copy\n' "$target" >> "$SU_REPAIR_LOG"
+    fi
+  fi
+  if su_cfg check "$name" backup; then
+    backup_cmd=$SU_V
+    printf 'backup command: %s\n' "$backup_cmd" >> "$SU_REPAIR_LOG"
+    if ! su_run_plain 120 "$backup_cmd" "$SU_REPAIR_LOG"; then
+      printf 'result: FAILED, the backup command failed; the repair was not attempted\n' >> "$SU_REPAIR_LOG"
+      su_check_failed "$c" "check $name: its backup command failed, so the repair was not attempted"
+      return 0
+    fi
+  fi
+  printf 'output:\n' >> "$SU_REPAIR_LOG"
+  su_run_plain 120 "$repair" "$SU_REPAIR_LOG"
+  status=$?
+  if [ "$status" = 0 ]; then
+    if [ -n "$SU_BACKUP" ]; then
+      printf 'result: written, original kept at %s\n' "$SU_BACKUP" >> "$SU_REPAIR_LOG"
+    else
+      printf 'result: written\n' >> "$SU_REPAIR_LOG"
+    fi
+  elif [ -n "$SU_BACKUP" ] && cmp -s -- "$SU_BACKUP" "$target"; then
+    printf 'result: FAILED (exit %s), target unchanged (compared with the backup)\n' "$status" >> "$SU_REPAIR_LOG"
+  elif [ -n "$SU_BACKUP" ]; then
+    printf 'result: FAILED (exit %s), target CHANGED; original kept at %s\n' "$status" "$SU_BACKUP" >> "$SU_REPAIR_LOG"
+  else
+    printf 'result: FAILED (exit %s)\n' "$status" >> "$SU_REPAIR_LOG"
+  fi
+  if su_run_plain 60 "$probe" /dev/null; then
+    printf 're-verify: satisfied\n' >> "$SU_REPAIR_LOG"
+    SU_C_STATE[c]=repaired
+    report_success "check $name: repaired and re-verified${SU_BACKUP:+ (original kept at $SU_BACKUP)}"
+    return 0
+  fi
+  printf 're-verify: still unmet\n' >> "$SU_REPAIR_LOG"
+  su_check_failed "$c" "check $name is still unmet after its repair${consequence:+: $consequence}"
+  return 0
+}
+
+su_check_failed() {
+  local c=$1 message=$2 blocked="${SU_C_DEP[$1]} does not start"
+  [ "${SU_C_DEP[$c]}" != all ] || blocked="no entry in a later stage starts"
+  SU_C_STATE[c]=failed
+  report_failure "$message" "check:${SU_C_NAME[$c]}"
+  SU_FAILED="$SU_FAILED check:${SU_C_NAME[$c]}"
+  su_fault local-config "check ${SU_C_NAME[$c]} is unmet, so $blocked" "$SU_REPAIR_LOG"
+}
+
+su_run_stage_checks() {
+  local stage=$1 c=0
+  while [ "$c" -lt "${#SU_C_NAME[@]}" ]; do
+    if [ "${SU_C_STAGE[$c]}" = "$stage" ]; then
+      if su_check_needed "$c"; then
+        su_run_check "$c"
+      else
+        SU_C_STATE[c]=skipped
+        report_skipped "check ${SU_C_NAME[$c]}: not needed (${SU_C_DEP[$c]} is not selected)"
+      fi
+    fi
+    c=$((c + 1))
+  done
+}
+
+# ---------------------------------------------------------------- smoke
+
+su_smoke() {
+  local url expect forbid timeout started code body required
+  SU_SMOKE_STATE=none
+  su_cfg stack "" smoke_url "" || { report_skipped "no smoke check configured"; return 0; }
+  url=$SU_V
+  su_cfg stack "" smoke_expect 200; expect=$SU_V
+  su_cfg stack "" smoke_timeout 200; timeout=$SU_V
+  if su_cfg stack "" smoke_requires; then
+    required=$SU_V
+    su_entry_index "$required"
+    if [ "${SU_E_STATE[$SU_I]}" != ok ]; then
+      report_skipped "smoke check skipped: $required is not running"
+      SU_SMOKE_STATE="skipped: $required is not running"
+      return 0
+    fi
+  fi
+  body=$SU_RUN_DIR/smoke.body
+  started=$SECONDS
+  while :; do
+    # -q and --noproxy '*' for the same reason as in su_wait_ready.
+    code=$(curl -q -s --noproxy '*' -o "$body" -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)
+    if [ "$code" = "$expect" ]; then
+      if su_cfg stack "" smoke_forbid; then
+        forbid=$SU_V
+        if [ ! -s "$body" ]; then
+          report_skipped "smoke body was empty, so smoke_forbid was not checked"
+        elif LC_ALL=C grep -E -e "$forbid" -- "$body" >/dev/null 2>&1; then
+          report_warning "smoke check: $url answered $code, but its body matches smoke_forbid"
+          SU_SMOKE_STATE=failed
+          SU_SMOKE_FAILED=1
+          return 1
+        fi
+      fi
+      report_success "smoke check: $url answered $code ($(report_duration $((SECONDS - started))))"
+      SU_SMOKE_STATE=passed
+      return 0
+    fi
+    if [ $((SECONDS - started)) -ge "$timeout" ]; then
+      report_warning "smoke check: $url did not answer $expect within ${timeout}s (last status ${code:-none})"
+      SU_SMOKE_STATE=failed
+      SU_SMOKE_FAILED=1
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+# ---------------------------------------------------------------- state
+
+su_prepare_state() {
+  local dir created=0
+  [ -d "$STACK_STATE" ] || created=1
+  for dir in "$STACK_STATE" "$STACK_LOGS" "$SU_RUN_DIR" "$SU_TOKENS"; do
+    if ! mkdir -p -- "$dir" 2>/dev/null || [ ! -w "$dir" ]; then
+      printf 'stack-up: cannot create or write %s\n' "$dir" >&2
+      exit 1
+    fi
+  done
+  [ "$created" = 0 ] || chmod 700 "$STACK_STATE" 2>/dev/null || true
+  SU_RUN_ID=$(date '+%Y%m%d-%H%M%S')-$$
+  REPORT_RUN_LOG=$STACK_LOGS/run-$SU_RUN_ID.log
+  # shellcheck disable=SC2034 # read by lib/report.sh
+  REPORT_HISTORY_FILE=$SU_HISTORY
+  # shellcheck disable=SC2034 # read by lib/report.sh
+  REPORT_VERSION=$SU_VERSION
+}
+
+# The lockf of older macOS releases has only the "lockf file command" form, so
+# "lockf -s -t 0 9" prints its usage and exits 64 (EX_USAGE) there; the run
+# lock needs the form that locks an open file descriptor.
+su_lock_tool_ok() {
+  command -v lockf >/dev/null 2>&1 || return 0
+  ( exec 9>>"$SU_LOCK" && exec lockf -s -t 0 9 ) >/dev/null 2>&1
+  [ "$?" != 64 ]
+}
+
+su_take_lock() {
+  local status
+  su_lock_tool_ok || lifecycle_abort "this Mac's lockf cannot lock an open file, which the run lock needs (older macOS releases have only lockf's file-and-command form); nothing was started or stopped"
+  lifecycle_take_lock "$SU_LOCK"
+  status=$?
+  if [ "$status" = 75 ]; then
+    printf 'stack-up: another stack-up run for %s holds the lock (%s); try again when it ends\n' "$SU_NAME" "$SU_LOCK" >&2
+    report_history busy "exit=4 version=$SU_VERSION another run holds the lock"
+    exit 4
+  fi
+}
+
+su_start_run() {
+  # shellcheck disable=SC2034 # read by lib/report.sh
+  REPORT_MODE=$1
+  su_prepare_state
+  su_take_lock
+  # Only a start leaves launches behind to stop; --stop and --clean are
+  # named by their mode, since they have no phases.
+  if [ "$1" = start ]; then
+    LIFECYCLE_INTERRUPT_HINT="Anything already started keeps running and is recorded; stop it with: $(su_stop_command)"
+  else
+    TERM_PHASE_LABEL=$1
+  fi
+  lifecycle_install_traps
+  su_cfg stack "" keep_awake auto
+  if [ "$SU_V" = auto ]; then
+    lifecycle_keep_awake || true
+  fi
+  term_banner "$SU_TITLE" "$SU_SUBTITLE"
+}
+
+# ---------------------------------------------------------------- modes
+
+su_mode_up() {
+  local i stage n=0 stage_count port problems="" command missing="" path kind name word run_started=$SECONDS
+  su_start_run start
+  LIFECYCLE_ABORT_HOOK=su_abort_stop_hint
+  su_launched_load
+  su_launched_prune
+
+  term_section_heading "Configuration"
+  su_resolve_options 1
+  i=0
+  while [ "$i" -lt "${#SU_O_NAME[@]}" ]; do
+    if [ "${SU_O_ON[$i]}" = yes ]; then
+      report_success "option ${SU_O_NAME[$i]}: on (${SU_O_SOURCE[$i]})"
+    else
+      report_detail "option ${SU_O_NAME[$i]}: off (${SU_O_SOURCE[$i]})"
+    fi
+    i=$((i + 1))
+  done
+  [ "${#SU_O_NAME[@]}" -gt 0 ] || report_detail "no options in this config"
+
+  term_section_heading "Selection"
+  su_select 1
+  report_detail "selected by $SU_SELECT_SOURCE: ${SU_PICKED:-nothing}"
+  if [ -z "$(su_selected_names | tr -d ' ')" ]; then
+    report_warning "nothing is selected: pass --select, answer the menu, or give entries tier = essential (an entry that is not a service also needs pick = yes)"
+  fi
+  i=0
+  while [ "$i" -lt "${#SU_ADDED[@]}" ]; do
+    report_detail "added ${SU_ADDED[$i]}"
+    i=$((i + 1))
+  done
+
+  term_section_heading "Plan"
+  if ! su_port_conflicts; then
+    while IFS= read -r word; do
+      [ -z "$word" ] || report_failure "$word"
+    done <<EOF
+$SU_CONFLICTS
+EOF
+    lifecycle_abort "two selected entries declare the same port; fix the config or the selection"
+  fi
+  stage_count=$(su_count_words "$SU_STAGES")
+  for stage in $SU_STAGES; do
+    su_order_stage "$stage"
+    report_detail "$stage: $(su_count_words "$SU_ORDER") selected${SU_ORDER:+ (}$(su_names_of "$SU_ORDER")${SU_ORDER:+)}"
+  done
+  i=0
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    if [ "${SU_E_SEL[$i]}" = 1 ] && ! su_entry_enabled "$i"; then
+      report_skipped "${SU_E_NAME[$i]}: off (option ${SU_E_OPTION[$i]})"
+    fi
+    i=$((i + 1))
+  done
+
+  term_section_heading "Preflight"
+  su_collect_requires
+  for command in $SU_REQUIRES; do
+    command -v "$command" >/dev/null 2>&1 || missing="$missing $command"
+  done
+  [ -z "$missing" ] || problems="${problems}missing commands:$missing$SU_NL"
+  i=0
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    if [ "${SU_E_SEL[$i]}" = 1 ] && su_entry_enabled "$i"; then
+      kind=${SU_E_KIND[$i]}
+      name=${SU_E_NAME[$i]}
+      if su_cfg_all "$kind" "$name" files; then
+        for path in "${SU_LIST[@]}"; do
+          su_entry_path "$i" "$path"
+          [ -e "$SU_X" ] || problems="${problems}$name needs $SU_X, which does not exist$SU_NL"
+        done
+      fi
+      if [ "$kind" = service ] || [ "$kind" = job ]; then
+        su_entry_dir "$i"
+        [ -d "$SU_X" ] || problems="${problems}$name has dir $SU_X, which does not exist$SU_NL"
+      fi
+      port=${SU_E_PORT[$i]}
+      if [ "$kind" = service ] && [ -n "$port" ] && ! su_known_defect_static "$i"; then
+        su_port_preflight "$i" "$port" || problems="${problems}$SU_WHY$SU_NL"
+      fi
+    fi
+    i=$((i + 1))
+  done
+  if [ -n "$problems" ]; then
+    while IFS= read -r word; do
+      [ -z "$word" ] || report_failure "$word"
+    done <<EOF
+$problems
+EOF
+    lifecycle_abort "preflight found $(printf '%s' "$problems" | LC_ALL=C grep -c .) problem(s); nothing was started"
+  fi
+  report_success "commands, files, folders and ports are ready"
+  i=0
+  while [ "$i" -lt "${#SU_L_NAME[@]}" ]; do
+    if [ -n "${SU_L_NAME[$i]}" ] && su_entry_index "${SU_L_NAME[$i]}" && [ "${SU_E_SEL[$SU_I]}" = 0 ]; then
+      report_detail "${SU_L_NAME[$i]} from an earlier run is still running and not selected now; --stop stops it"
+    fi
+    i=$((i + 1))
+  done
+
+  su_option_off_stops
+  if su_compose_selected; then
+    term_section_heading "Container engine"
+    su_ensure_engine
+  fi
+
+  n=0
+  for stage in $SU_STAGES; do
+    n=$((n + 1))
+    term_phase_heading "$n/$stage_count" "$stage"
+    su_order_stage "$stage"
+    if [ -z "$SU_ORDER" ]; then
+      report_skipped "nothing selected in this stage"
+    else
+      su_run_stage "$stage" "$SU_ORDER"
+    fi
+    su_run_stage_checks "$stage"
+  done
+  term_close_phase
+
+  term_section_heading "Verification"
+  su_smoke || true
+  su_recheck_services
+
+  su_summary "$run_started"
+}
+
+su_known_defect_static() {
+  su_cfg "${SU_E_KIND[$1]}" "${SU_E_NAME[$1]}" known_defect
+}
+
+su_collect_requires() {
+  local i=0 command need_curl=0 need_lsof=0
+  SU_REQUIRES=""
+  if su_cfg_all stack "" require; then
+    for command in "${SU_LIST[@]}"; do
+      SU_REQUIRES="$SU_REQUIRES $command"
+    done
+  fi
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    if [ "${SU_E_SEL[$i]}" = 1 ] && su_entry_enabled "$i"; then
+      if su_cfg_all "${SU_E_KIND[$i]}" "${SU_E_NAME[$i]}" requires; then
+        for command in "${SU_LIST[@]}"; do
+          SU_REQUIRES="$SU_REQUIRES $command"
+        done
+      fi
+      if [ "${SU_E_KIND[$i]}" = service ]; then
+        need_lsof=1
+        su_ready_spec "$i"
+        case $SU_READY in
+          http*) need_curl=1 ;;
+        esac
+      fi
+      if [ "${SU_E_KIND[$i]}" = compose ]; then
+        SU_REQUIRES="$SU_REQUIRES $SU_ENGINE"
+      fi
+    fi
+    i=$((i + 1))
+  done
+  su_cfg stack "" smoke_url && need_curl=1
+  [ "$need_curl" = 0 ] || SU_REQUIRES="$SU_REQUIRES curl"
+  [ "$need_lsof" = 0 ] || SU_REQUIRES="$SU_REQUIRES lsof pgrep nc"
+  SU_REQUIRES=$(su_words "$SU_REQUIRES")
+}
+
+# A declared port must be free, or held only by the group this stack started
+# for the same entry (which is then restarted). A group this stack recorded
+# under another entry is named with that entry, since --stop frees it; anyone
+# else is named by PID. Nothing is signalled.
+su_port_preflight() {
+  local i=$1 port=$2 name=${SU_E_NAME[$1]} pid k
+  SU_WHY=""
+  if su_listeners "$port"; then
+    for pid in $SU_LISTENERS; do
+      if su_launched_find "$name" && k=$SU_I && su_members "${SU_L_PGID[$k]}" && util_contains_word "$pid" "$SU_MEMBERS" && su_group_is_ours "${SU_L_PGID[$k]}" "${SU_L_TOKEN[$k]}"; then
+        continue
+      fi
+      k=0
+      while [ "$k" -lt "${#SU_L_NAME[@]}" ]; do
+        if [ -n "${SU_L_NAME[$k]}" ] && su_members "${SU_L_PGID[$k]}" && util_contains_word "$pid" "$SU_MEMBERS" && su_group_is_ours "${SU_L_PGID[$k]}" "${SU_L_TOKEN[$k]}"; then
+          SU_WHY="port $port for $name is held by ${SU_L_NAME[$k]} (PID $pid), which this stack started in an earlier run; stop it with $(su_stop_command), or change the port"
+          return 1
+        fi
+        k=$((k + 1))
+      done
+      SU_WHY="port $port for $name is held by PID $(su_describe_pid "$pid"), which this stack did not start; stop it yourself or change the port"
+      return 1
+    done
+    return 0
+  fi
+  if su_port_answers "$port"; then
+    SU_WHY="port $port for $name answers connections, but its owner is not visible to this account; free it or change the port"
+    return 1
+  fi
+  return 0
+}
+
+su_compose_selected() {
+  local i=0
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    if [ "${SU_E_SEL[$i]}" = 1 ] && [ "${SU_E_KIND[$i]}" = compose ] && su_entry_enabled "$i"; then
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+su_option_off_stops() {
+  local o=0 i name services
+  while [ "$o" -lt "${#SU_O_NAME[@]}" ]; do
+    if [ "${SU_O_ON[$o]}" = no ]; then
+      su_cfg option "${SU_O_NAME[$o]}" when_off leave
+      if [ "$SU_V" = stop ]; then
+        i=0
+        while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+          name=${SU_E_NAME[$i]}
+          if [ "${SU_E_OPTION[$i]}" = "${SU_O_NAME[$o]}" ]; then
+            if [ "${SU_E_KIND[$i]}" = service ] && su_launched_find "$name"; then
+              if su_stop_recorded "$name" "$(su_stop_timeout "$i")"; then
+                report_success "option ${SU_O_NAME[$o]} is off: stopped $name"
+              else
+                report_warning "option ${SU_O_NAME[$o]} is off, but $name was left running: $SU_WHY"
+              fi
+            elif [ "${SU_E_KIND[$i]}" = compose ]; then
+              if ! su_engine_up; then
+                report_warning "option ${SU_O_NAME[$o]} is off, but the container engine did not answer engine_check, so compose $name was not stopped"
+              else
+                su_cfg compose "$name" services ""
+                services=$SU_V
+                # shellcheck disable=SC2086 # services is a validated list of plain names
+                if lifecycle_run_with_deadline 300 su_in_log /dev/null su_compose_args stop $services; then
+                  report_success "option ${SU_O_NAME[$o]} is off: stopped compose $name"
+                else
+                  report_warning "option ${SU_O_NAME[$o]} is off, but compose $name could not be stopped"
+                fi
+              fi
+            fi
+          fi
+          i=$((i + 1))
+        done
+      fi
+    fi
+    o=$((o + 1))
+  done
+}
+
+su_run_stage() {
+  local stage=$1 order=$2 i parallel=0 launched="" dep j k rest
+  util_contains_word "$stage" "$SU_PARALLEL" && parallel=1
+  for i in $order; do
+    if ! su_entry_enabled "$i"; then
+      report_skipped "${SU_E_NAME[$i]}: off (option ${SU_E_OPTION[$i]})"
+      su_mark "$i" off
+      continue
+    fi
+    if su_known_defect "$i"; then
+      continue
+    fi
+    # A dependency launched earlier in this parallel stage is still pending,
+    # so it is waited for here instead of blocking the entry that needs it.
+    if [ "$parallel" = 1 ]; then
+      for dep in ${SU_E_DEPS[$i]}; do
+        su_entry_index "$dep" || continue
+        j=$SU_I
+        util_contains_word "$j" "$launched" || continue
+        su_await_service "$j"
+        rest=""
+        for k in $launched; do
+          [ "$k" = "$j" ] || rest="$rest $k"
+        done
+        launched=$rest
+      done
+    fi
+    if su_entry_blocked "$i"; then
+      su_fail_with_owner "$i" "${SU_E_NAME[$i]} not started: $SU_WHY" local-config "$SU_WHY"
+      continue
+    fi
+    case ${SU_E_KIND[$i]} in
+      env) su_run_env_entry "$i" ;;
+      job) su_pre_start "$i" && su_run_job_entry "$i" ;;
+      compose) su_pre_start "$i" && su_run_compose_entry "$i" ;;
+      service)
+        if su_start_service "$i"; then
+          if [ "$parallel" = 1 ]; then
+            launched="$launched $i"
+          else
+            su_await_service "$i"
+          fi
+        fi
+        ;;
+    esac
+  done
+  if [ -n "$launched" ]; then
+    report_detail "waiting for $(su_count_words "$launched") service(s) to become ready"
+    for i in $launched; do
+      su_await_service "$i"
+    done
+  fi
+  return 0
+}
+
+su_summary() {
+  local run_started=$1 stage i ok failed other line failures degraded detail closing url smoke ran=0 skipped=0
+  term_section_heading "Summary"
+  for stage in $SU_STAGES; do
+    ok=0; failed=0; other=0
+    i=0
+    while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+      if [ "${SU_E_SEL[$i]}" = 1 ] && [ "${SU_E_STAGE[$i]}" = "$stage" ]; then
+        case ${SU_E_STATE[$i]} in
+          ok|skipped-run-if) ok=$((ok + 1)) ;;
+          failed|degraded) failed=$((failed + 1)) ;;
+          *) other=$((other + 1)) ;;
+        esac
+      fi
+      i=$((i + 1))
+    done
+    ran=$((ran + ok))
+    skipped=$((skipped + other))
+    line="$stage: $ok ok"
+    [ "$failed" = 0 ] || line="$line, $failed failed"
+    [ "$other" = 0 ] || line="$line, $other skipped or off"
+    report_detail "$line"
+  done
+  i=0
+  local checks=""
+  while [ "$i" -lt "${#SU_C_NAME[@]}" ]; do
+    checks="$checks ${SU_C_NAME[$i]}=${SU_C_STATE[$i]}"
+    i=$((i + 1))
+  done
+  [ -z "$checks" ] || report_detail "checks:$checks"
+  i=0
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    if [ "${SU_E_STATE[$i]}" = ok ] && [ "${SU_E_KIND[$i]}" = service ] && su_cfg service "${SU_E_NAME[$i]}" url; then
+      report_detail "${SU_E_NAME[$i]} is at $SU_V"
+    fi
+    i=$((i + 1))
+  done
+  if [ "$SU_ADVISORY" -gt 0 ]; then
+    report_warning "$SU_ADVISORY advisory check(s) unmet; see the lines above"
+  fi
+  if [ -n "${SU_DEFECTS// /}" ]; then
+    su_cfg stack "" defect_owner upstream
+    su_fault "$SU_V" "known defects skipped:$SU_DEFECTS" "$REPORT_RUN_LOG"
+  fi
+  report_detail "total time $(report_duration $((SECONDS - run_started)))"
+  failures=$(su_count_words "$SU_FAILED")
+  degraded=$(su_count_words "$SU_DEGRADED")
+  [ "$SU_SMOKE_FAILED" = 0 ] || degraded=$((degraded + 1))
+  su_outcome "$failures" "$degraded"
+  detail="selected=[$(su_join "$(su_selected_names)")] failed=[$(su_join "$SU_FAILED")] degraded=[$(su_join "$SU_DEGRADED")] defects=[$(su_join "$SU_DEFECTS")]"
+  [ "$SU_SMOKE_FAILED" = 0 ] || detail="$detail smoke=failed"
+  su_cfg stack "" smoke_url ""; smoke=$SU_V
+  su_cfg stack "" open_url "$smoke"; url=$SU_V
+  case $SU_OUTCOME in
+    open)
+      # "Open URL" only when the smoke check proved that very address; any
+      # other open_url is shown, but marked not checked.
+      if [ -z "$(su_selected_names | tr -d ' ')" ]; then
+        closing="Open: nothing was selected, so nothing started"
+      elif [ "$ran" = 0 ]; then
+        closing="Open: this run started nothing (0 started, $skipped skipped or off)"
+      elif [ -n "$url" ] && [ "$SU_SMOKE_STATE" = passed ] && [ "$url" = "$smoke" ]; then
+        closing="Open $url"
+      elif [ -n "$url" ] && { [ "$SU_SMOKE_STATE" = passed ] || { [ "$SU_SMOKE_STATE" = none ] && [ -z "$smoke" ]; }; }; then
+        closing="Open (not checked): $url"
+      else
+        closing="Open: everything that started is running"
+        [ "$skipped" = 0 ] || closing="$closing ($skipped skipped or off)"
+        case $SU_SMOKE_STATE in
+          skipped*) closing="$closing (smoke check ${SU_SMOKE_STATE})" ;;
+        esac
+      fi
+      [ "$SU_ADVISORY" = 0 ] || closing="$closing ($SU_ADVISORY advisory check(s) unmet)"
+      printf '\n  %s%s%s\n' "$TERM_COLOR_SUCCESS" "$closing" "$TERM_COLOR_RESET"
+      ;;
+    degraded)
+      closing="Degraded:"
+      [ -z "${SU_DEGRADED// /}" ] || closing="$closing$SU_DEGRADED did not finish (on_fail = warn);"
+      [ "$SU_SMOKE_FAILED" = 0 ] || closing="$closing the smoke check failed;"
+      closing="$closing everything else started. Read the warnings above before you rely on it."
+      printf '\n  %s%s%s\n' "$TERM_COLOR_WARNING" "$closing" "$TERM_COLOR_RESET"
+      ;;
+    partial)
+      closing="Partial: $failures failed:$SU_FAILED. The stack is not fully up; read the WHO and WHAT lines above."
+      printf '\n  %s%s%s\n' "$TERM_COLOR_FAILURE" "$closing" "$TERM_COLOR_RESET"
+      ;;
+  esac
+  report_log INFO "closing line: $closing"
+  printf '  %sStop it with%s  %s\n' "$TERM_COLOR_MUTED" "$TERM_COLOR_RESET" "$(su_stop_command)"
+  printf '  %sRun log%s       %s\n\n' "$TERM_COLOR_MUTED" "$TERM_COLOR_RESET" "$REPORT_RUN_LOG"
+  report_verdict "$SU_OUTCOME" "$SU_EXIT" "$detail"
+}
+
+su_names_of() {
+  local i out=""
+  for i in $1; do
+    out="$out${out:+ }${SU_E_NAME[$i]}"
+  done
+  printf '%s' "$out"
+}
+
+su_selected_names() {
+  local i=0 out=""
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    [ "${SU_E_SEL[$i]}" != 1 ] || out="$out ${SU_E_NAME[$i]}"
+    i=$((i + 1))
+  done
+  printf '%s\n' "$out"
+}
+
+# Names every listener on a port this stack declares or recorded, except the
+# ports of records still left running; with the launch table lost or moved,
+# these are the only trace of what may still be up.
+su_port_holders() {
+  local ports="" port k=0
+  SU_HELD=""
+  while [ "$k" -lt "${#SU_L_PORT[@]}" ]; do
+    [ -z "${SU_L_PORT[$k]}" ] || [ -n "${SU_L_NAME[$k]}" ] || ports="$ports ${SU_L_PORT[$k]}"
+    k=$((k + 1))
+  done
+  k=0
+  while [ "$k" -lt "${#SU_E_PORT[@]}" ]; do
+    [ -z "${SU_E_PORT[$k]}" ] || ports="$ports ${SU_E_PORT[$k]}"
+    k=$((k + 1))
+  done
+  for port in $(su_words "$ports"); do
+    k=0
+    while [ "$k" -lt "${#SU_L_PORT[@]}" ]; do
+      [ -z "${SU_L_NAME[$k]}" ] || [ "${SU_L_PORT[$k]}" != "$port" ] || continue 2
+      k=$((k + 1))
+    done
+    if su_listeners "$port"; then
+      SU_HELD="$SU_HELD port $port by PID $(su_describe_pid "${SU_LISTENERS%% *}")"
+    fi
+  done
+}
+
+su_mode_stop() {
+  local i name pgid token grace stopped=0 left="" foreign="" record_count services running engine_checked=0 engine_status status
+  if [ ! -d "$STACK_STATE" ] && [ -z "$(conf_names compose)" ]; then
+    printf 'stack-up: nothing to stop; %s does not exist, so this stack has not run here\n' "$STACK_STATE"
+    su_port_holders
+    [ -z "$SU_HELD" ] || printf 'stack-up: in use by programs this stack has no record of (left running):%s\n' "$SU_HELD"
+    exit 0
+  fi
+  su_start_run stop
+  su_launched_load
+  term_section_heading "Stop"
+  record_count=0
+  i=${#SU_L_NAME[@]}
+  while [ "$i" -gt 0 ]; do
+    i=$((i - 1))
+    name=${SU_L_NAME[$i]}
+    [ -n "$name" ] || continue
+    record_count=$((record_count + 1))
+    pgid=${SU_L_PGID[$i]}
+    token=${SU_L_TOKEN[$i]}
+    grace=10
+    if su_entry_index "$name" && [ "${SU_E_KIND[$SU_I]}" = service ]; then
+      grace=$(su_stop_timeout "$SU_I")
+    fi
+    su_members "$pgid"
+    if [ "$?" = 1 ]; then
+      report_detail "$name had already stopped"
+      SU_L_NAME[i]=""
+      continue
+    fi
+    if su_stop_group "$pgid" "$token" "$grace"; then
+      report_success "stopped $name (process group $pgid)"
+      stopped=$((stopped + 1))
+      SU_L_NAME[i]=""
+    else
+      report_warning "$name: $SU_WHY; its launch record and token are kept for the next --stop"
+      left="$left $name"
+    fi
+  done
+  su_launched_write
+  su_stop_strays
+  left="$left$SU_STRAY_LEFT"
+  if [ "$record_count" = 0 ] && [ -z "$SU_STRAY_LEFT" ]; then
+    report_skipped "Nothing from this stack was running"
+  fi
+  if [ -n "$(conf_names compose)" ]; then
+    su_engine_up
+    engine_status=$?
+    if [ "$engine_status" = 0 ]; then
+      engine_checked=1
+      for name in $(conf_names compose); do
+        su_cfg compose "$name" services ""
+        services=$SU_V
+        # shellcheck disable=SC2086 # services is a validated list of plain names
+        if lifecycle_run_with_deadline 300 su_in_log /dev/null su_compose_args stop $services; then
+          report_success "compose $name: stopped $services (project $SU_NAME)"
+        else
+          report_warning "compose $name: stop failed"
+          left="$left compose:$name"
+        fi
+      done
+    elif [ "$engine_status" = 124 ]; then
+      report_warning "engine_check did not finish within 30s, so the compose services of $SU_NAME could not be checked or stopped"
+      left="$left compose"
+    else
+      report_detail "the container engine is not running, so no compose service of $SU_NAME is running"
+    fi
+  fi
+
+  term_section_heading "Verification"
+  su_port_holders
+  foreign=$SU_HELD
+  if [ "$engine_checked" = 1 ]; then
+    running=$(lifecycle_run_with_deadline 30 su_errs_to /dev/null su_compose_args ps -q --status running)
+    status=$?
+    running=$(printf '%s' "$running" | LC_ALL=C grep -c .)
+    if [ "$status" != 0 ]; then
+      report_warning "listing the containers of compose project $SU_NAME failed (exit $status), so they could not be checked"
+      left="$left containers"
+    elif [ "${running:-0}" -gt 0 ]; then
+      report_warning "$running container(s) of compose project $SU_NAME are still running"
+      left="$left containers"
+    else
+      report_success "no container of compose project $SU_NAME is running"
+    fi
+  fi
+  if [ -n "$foreign" ]; then
+    report_warning "in use by programs this stack has no record of (left running):$foreign"
+  fi
+  if [ -z "$left" ]; then
+    if [ -f "$SU_LAUNCHED" ] && [ ! -s "$SU_LAUNCHED" ]; then
+      mv -f -- "$SU_LAUNCHED" "$SU_RUN_DIR/launched-$SU_RUN_ID.tsv" 2>/dev/null || true
+    fi
+    su_remove_dead_tokens
+    report_success "Everything this stack recorded is down. Safe to power off the machine."
+    report_verdict down 0 "stopped=$stopped"
+  fi
+  report_warning "left running:$left; run $(su_stop_command) again, or stop them by hand"
+  report_verdict leftovers 1 "stopped=$stopped left=[$(su_join "$left")]"
+}
+
+# Every token under run/tokens is checked, recorded or not: a holder outside
+# the recorded group, or any holder of a token with no record, is a process
+# this stack launched that left its group. It is named and not signalled, its
+# token is kept, and --stop exits 1.
+su_stop_strays() {
+  local token k pgid
+  SU_STRAY_LEFT=""
+  [ -d "$SU_TOKENS" ] || return 0
+  for token in "$SU_TOKENS"/*; do
+    [ -f "$token" ] || continue
+    if ! command -v lsof >/dev/null 2>&1; then
+      report_warning "lsof is not available, so the launch tokens under $SU_TOKENS could not be checked for processes that left their group; the tokens are kept"
+      SU_STRAY_LEFT="$SU_STRAY_LEFT tokens"
+      return 0
+    fi
+    pgid=""
+    su_token_entry "$token"
+    k=0
+    while [ "$k" -lt "${#SU_L_NAME[@]}" ]; do
+      if [ -n "${SU_L_NAME[$k]}" ] && [ "${SU_L_TOKEN[$k]}" = "$token" ]; then
+        pgid=${SU_L_PGID[$k]}
+        SU_X=${SU_L_NAME[$k]}
+      fi
+      k=$((k + 1))
+    done
+    su_token_strays "$token" "$pgid" || continue
+    report_warning "$SU_X: $SU_STRAYS left the process group this stack started but still holds its launch token, so it was not signalled; stop it by hand (token kept: $token)"
+    SU_STRAY_LEFT="$SU_STRAY_LEFT stray:$SU_X"
+  done
+}
+
+su_remove_dead_tokens() {
+  local token i live
+  [ -d "$SU_TOKENS" ] || return 0
+  for token in "$SU_TOKENS"/*; do
+    [ -f "$token" ] || continue
+    live=0
+    i=0
+    while [ "$i" -lt "${#SU_L_NAME[@]}" ]; do
+      if [ -n "${SU_L_NAME[$i]}" ] && [ "${SU_L_TOKEN[$i]}" = "$token" ]; then
+        live=1
+      fi
+      i=$((i + 1))
+    done
+    [ "$live" = 0 ] || continue
+    su_token_strays "$token" ""
+    [ "$?" = 1 ] || continue
+    rm -f -- "$token"
+  done
+}
+
+# --check writes no run log or history, so it cannot use the lifecycle traps.
+# A probe runs in its own process group, which a terminal's Ctrl-C does not
+# reach, so an interrupted --check stops that group itself. A leader that is
+# gone was already reaped and its group ID may be reused, so it is left alone.
+su_check_interrupted() {
+  local name=$1 status=$2 pgid=${LIFECYCLE_DEADLINE_PGID:-}
+  trap '' INT TERM HUP
+  if [ -n "$pgid" ] && su_alive "$pgid"; then
+    su_signal_group TERM "$pgid"
+    su_wait_group_gone "$pgid" 5 || { ! su_group_exists "$pgid" || su_signal_group KILL "$pgid"; }
+  fi
+  printf '\n  --check interrupted by %s; any running probe was stopped\n' "$name" >&2
+  exit "$status"
+}
+
+su_mode_check() {
+  local c=0 name probe unmet=0 notchecked=0 state
+  trap 'su_check_interrupted INT 130' INT
+  trap 'su_check_interrupted TERM 143' TERM
+  trap 'su_check_interrupted HUP 129' HUP
+  printf '\n  %s: checks (probes only, nothing is repaired)\n' "$SU_TITLE"
+  while [ "$c" -lt "${#SU_C_NAME[@]}" ]; do
+    name=${SU_C_NAME[$c]}
+    su_cfg check "$name" probe ""; probe=$SU_V
+    if [ -n "${SU_C_GATE[$c]}" ] && su_check_index "${SU_C_GATE[$c]}" && [ "${SU_C_STATE[$SU_I]}" != ok ]; then
+      state="not checked (gate ${SU_C_GATE[$c]} did not pass)"
+      SU_C_STATE[c]=not-checked
+      [ "${SU_C_LEVEL[$c]}" != required ] || notchecked=$((notchecked + 1))
+    elif su_run_plain 60 "$probe" /dev/null; then
+      state=satisfied
+      SU_C_STATE[c]=ok
+    else
+      state="unmet"
+      SU_C_STATE[c]=unmet
+      [ "${SU_C_LEVEL[$c]}" != required ] || unmet=$((unmet + 1))
+    fi
+    printf '    %-24s %-9s %s\n' "$name" "${SU_C_LEVEL[$c]}" "$state"
+    c=$((c + 1))
+  done
+  [ "${#SU_C_NAME[@]}" -gt 0 ] || printf '    no [check] sections in this config\n'
+  if [ $((unmet + notchecked)) -gt 0 ]; then
+    if [ "$notchecked" -gt 0 ]; then
+      printf '\n  %s required check(s) unmet, %s not checked\n' "$unmet" "$notchecked"
+    else
+      printf '\n  %s required check(s) unmet\n' "$unmet"
+    fi
+    exit 1
+  fi
+  printf '\n  every required check is satisfied\n'
+  exit 0
+}
+
+su_mode_plan() {
+  local stage n=0 count i name value status=0 c where missing="" command
+  su_check_cli_against_config
+  su_resolve_options 0
+  su_select 0
+  count=$(su_count_words "$SU_STAGES")
+  printf '\n  %s\n' "$SU_TITLE"
+  [ -z "$SU_SUBTITLE" ] || printf '  %s\n' "$SU_SUBTITLE"
+  printf '\n  Plan (nothing runs and no file is written)\n'
+  printf '    config     %s\n' "$SU_CONFIG_ABS"
+  printf '    root       %s\n' "$STACK_ROOT"
+  printf '    state      %s\n' "$STACK_STATE"
+  i=0
+  while [ "$i" -lt "${#SU_O_NAME[@]}" ]; do
+    if [ "${SU_O_ON[$i]}" = yes ]; then value=on; else value=off; fi
+    printf '    option     %s: %s (%s)\n' "${SU_O_NAME[$i]}" "$value" "${SU_O_SOURCE[$i]}"
+    i=$((i + 1))
+  done
+  printf '    selected   %s (%s)\n' "${SU_PICKED:-nothing}" "$SU_SELECT_SOURCE"
+  i=0
+  while [ "$i" -lt "${#SU_ADDED[@]}" ]; do
+    printf '    added      %s\n' "${SU_ADDED[$i]}"
+    i=$((i + 1))
+  done
+  i=0
+  local not_selected=""
+  while [ "$i" -lt "${#SU_E_NAME[@]}" ]; do
+    if [ "${SU_E_SEL[$i]}" = 1 ] && ! su_entry_enabled "$i"; then
+      printf '    off        %s: off (option %s)\n' "${SU_E_NAME[$i]}" "${SU_E_OPTION[$i]}"
+    elif [ "${SU_E_SEL[$i]}" = 0 ] && [ "${SU_E_PICK[$i]}" = yes ]; then
+      not_selected="$not_selected ${SU_E_NAME[$i]}"
+    fi
+    i=$((i + 1))
+  done
+  [ -z "$not_selected" ] || printf '    not selected:%s\n' "$not_selected"
+  su_collect_requires
+  for command in $SU_REQUIRES; do
+    command -v "$command" >/dev/null 2>&1 || missing="$missing $command"
+  done
+  printf '    requires   %s%s\n' "${SU_REQUIRES:-nothing}" "${missing:+ (missing:$missing)}"
+  for stage in $SU_STAGES; do
+    n=$((n + 1))
+    printf '\n  %s/%s  %s\n' "$n" "$count" "$stage"
+    su_order_stage "$stage"
+    [ -n "$SU_ORDER" ] || printf '    nothing selected in this stage\n'
+    for i in $SU_ORDER; do
+      su_entry_enabled "$i" || continue
+      su_plan_entry "$i"
+    done
+    c=0
+    while [ "$c" -lt "${#SU_C_NAME[@]}" ]; do
+      if [ "${SU_C_STAGE[$c]}" = "$stage" ] && su_check_needed "$c"; then
+        name=${SU_C_NAME[$c]}
+        printf '    check %s (%s, for %s)\n' "$name" "${SU_C_LEVEL[$c]}" "${SU_C_DEP[$c]}"
+        su_cfg check "$name" probe ""; printf '      probe    %s\n' "$SU_V"
+        [ -z "${SU_C_GATE[$c]}" ] || printf '      gate     %s\n' "${SU_C_GATE[$c]}"
+        if su_cfg check "$name" repair; then
+          value=$SU_V
+          if su_cfg check "$name" target; then su_path "$SU_V"; where="copy of $SU_X"; else su_cfg check "$name" backup ""; where="command: $SU_V"; fi
+          printf '      repair   %s\n      backup   %s, taken first\n' "$value" "$where"
+        fi
+      fi
+      c=$((c + 1))
+    done
+  done
+  if su_cfg stack "" smoke_url; then
+    value=$SU_V
+    su_cfg stack "" smoke_expect 200
+    printf '\n  smoke        %s must answer %s' "$value" "$SU_V"
+    su_cfg stack "" smoke_timeout 200
+    printf ' within %ss\n' "$SU_V"
+  fi
+  if ! su_port_conflicts; then
+    printf '\n  Port conflicts (the run would stop at Plan):\n'
+    printf '%s' "$SU_CONFLICTS" | LC_ALL=C sed 's/^/    /'
+    status=1
+  fi
+  printf '\n'
+  exit "$status"
+}
+
+su_plan_entry() {
+  local i=$1 kind=${SU_E_KIND[$1]} name=${SU_E_NAME[$1]} value key
+  if su_cfg "$kind" "$name" known_defect; then
+    printf '    %s %s: known defect, never started (%s)\n' "$kind" "$name" "$SU_V"
+    return 0
+  fi
+  if [ -n "${SU_E_PORT[$i]}" ]; then
+    printf '    %s %s  :%s\n' "$kind" "$name" "${SU_E_PORT[$i]}"
+  else
+    printf '    %s %s\n' "$kind" "$name"
+  fi
+  case $kind in
+    service)
+      su_cfg service "$name" start ""; printf '      start    %s\n' "$SU_V"
+      su_entry_dir "$i"; printf '      dir      %s\n' "$SU_X"
+      su_cfg service "$name" build && printf '      build    %s\n' "$SU_V"
+      su_ready_spec "$i"
+      su_cfg service "$name" ready_timeout 60
+      printf '      ready    %s within %ss\n' "$SU_READY" "$SU_V"
+      ;;
+    job)
+      su_cfg job "$name" run ""; printf '      run      %s\n' "$SU_V"
+      su_cfg job "$name" run_if && printf '      run_if   %s\n' "$SU_V"
+      su_entry_dir "$i"; printf '      dir      %s\n' "$SU_X"
+      su_cfg job "$name" timeout 600; printf '      deadline %ss\n' "$SU_V"
+      ;;
+    compose)
+      su_cfg compose "$name" services ""; printf '      services %s (project %s)\n' "$SU_V" "$SU_NAME"
+      ;;
+    env)
+      su_cfg env "$name" run ""; printf '      run      %s (values are kept in memory, never shown)\n' "$SU_V"
+      ;;
+  esac
+  su_cfg "$kind" "$name" known_defect_check && printf '      defect check  %s (run at start)\n' "$SU_V"
+  if su_cfg_all "$kind" "$name" env; then
+    value=""
+    for key in "${SU_LIST[@]}"; do
+      value="$value ${key%%=*}"
+    done
+    printf '      env     %s\n' "$value"
+  fi
+  su_cfg "$kind" "$name" env_file && printf '      env_file %s\n' "$SU_V"
+  [ -z "${SU_E_ENVFROM[$i]}" ] || printf '      env_from %s (keys only at run time)\n' "${SU_E_ENVFROM[$i]}"
+  [ -z "${SU_E_DEPS[$i]}" ] || printf '      after    %s\n' "${SU_E_DEPS[$i]}"
+  printf '      on_fail  %s\n' "${SU_E_ONFAIL[$i]}"
+  return 0
+}
+
+su_mode_print_paths() {
+  local files="" k=0 engine
+  printf 'stack-up paths for %s\n' "$SU_NAME"
+  printf '  config         %s\n' "$SU_CONFIG_ABS"
+  printf '  root           %s\n' "$STACK_ROOT"
+  printf '  state          %s\n' "$STACK_STATE"
+  printf '  logs           %s\n' "$STACK_LOGS"
+  printf '  history        %s\n' "$SU_HISTORY"
+  printf '  launch table   %s\n' "$SU_LAUNCHED"
+  printf '  launch tokens  %s\n' "$SU_TOKENS"
+  printf '  lock           %s\n' "$SU_LOCK"
+  printf '  backups        %s\n' "$SU_BACKUPS"
+  printf '  repair log     %s\n' "$SU_REPAIR_LOG"
+  printf '  heal ledger    %s\n' "$SU_HEALS"
+  printf '  project        %s\n' "$SU_NAME"
+  while [ "$k" -lt "${#SU_COMPOSE_FILES[@]}" ]; do
+    files="$files -f $(su_quote "${SU_COMPOSE_FILES[$k]}")"
+    k=$((k + 1))
+  done
+  engine=$SU_ENGINE
+  printf '\nstack-up never asks compose to remove containers or volumes; a start'"'"'s compose up -d still recreates a container whose configuration or image changed. To remove this project'"'"'s by hand:\n'
+  if [ -n "$(conf_names compose)" ]; then
+    printf '  %s -p %s%s down\n' "$SU_COMPOSE_CMD" "$SU_NAME" "$files"
+    # shellcheck disable=SC2016 # printed for the user to run, never run here
+    printf '  %s volume rm $(%s volume ls -q --filter label=com.docker.compose.project=%s)\n' "$engine" "$engine" "$SU_NAME"
+  else
+    printf '  (this config has no [compose] entries, so there is nothing to remove)\n'
+  fi
+  printf '\nTo forget this stack after %s, delete its state folder:\n' "$(su_stop_command)"
+  printf '  rm -r -- %s\n' "$(su_quote "$STACK_STATE")"
+  exit 0
+}
+
+su_mode_clean() {
+  local keep logs n=0 file candidates="" count=0 removed=0 live i question
+  if [ ! -d "$STACK_STATE" ]; then
+    printf 'stack-up: nothing to clean; %s does not exist\n' "$STACK_STATE"
+    exit 0
+  fi
+  su_start_run clean
+  su_launched_load
+  term_section_heading "Clean"
+  su_cfg stack "" keep_runs 0; keep=$SU_V
+  if [ "$keep" -gt 0 ]; then
+    # Only the run-TIME-PID.log names su_prepare_state gives: an entry named
+    # run-... has its own log in the same folder.
+    logs=$(cd "$STACK_LOGS" 2>/dev/null && for file in run-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9]*.log; do [ -f "$file" ] && printf '%s\n' "$file"; done | LC_ALL=C sort -r)
+    while IFS= read -r file; do
+      [ -n "$file" ] || continue
+      n=$((n + 1))
+      [ "$STACK_LOGS/$file" != "$REPORT_RUN_LOG" ] || continue
+      if [ "$n" -gt $((keep + 1)) ]; then
+        candidates="$candidates$STACK_LOGS/$file$SU_NL"
+      fi
+    done <<EOF
+$logs
+EOF
+  else
+    report_detail "keep_runs is 0, so every run log is kept"
+  fi
+  for file in "$SU_RUN_DIR"/launched-*.tsv; do
+    [ -f "$file" ] && candidates="$candidates$file$SU_NL"
+  done
+  for file in "$SU_TOKENS"/*; do
+    [ -f "$file" ] || continue
+    live=0
+    i=0
+    while [ "$i" -lt "${#SU_L_NAME[@]}" ]; do
+      [ "${SU_L_TOKEN[$i]}" != "$file" ] || live=1
+      i=$((i + 1))
+    done
+    [ "$live" = 0 ] || continue
+    su_token_strays "$file" ""
+    case $? in
+      0)
+        report_warning "kept $file: $SU_STRAYS still holds it, a process this stack launched that left its process group"
+        continue
+        ;;
+      2)
+        report_warning "kept $file: lsof is not available to check whether a process still holds it"
+        continue
+        ;;
+    esac
+    candidates="$candidates$file$SU_NL"
+  done
+  count=$(printf '%s' "$candidates" | LC_ALL=C grep -c .)
+  if [ "$count" = 0 ]; then
+    report_success "nothing to clean"
+    report_verdict cleaned 0 "removed=0"
+  fi
+  printf '%s' "$candidates" | LC_ALL=C sed 's/^/      /'
+  question="Delete these $count file(s)? They belong to this stack's state only."
+  if [ "$SU_YES" = 1 ]; then
+    report_log ASK "$question (--yes, so the answer is yes)"
+  else
+    su_ask_yes_no "$question" no
+    if [ "$SU_ANSWER" != yes ]; then
+      report_skipped "nothing deleted (confirm at a terminal, or pass --yes)"
+      report_verdict declined 1 "removed=0"
+    fi
+  fi
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if rm -f -- "$file"; then
+      report_log INFO "deleted $file"
+      removed=$((removed + 1))
+    else
+      report_warning "could not delete $file"
+    fi
+  done <<EOF
+$candidates
+EOF
+  if [ "$removed" != "$count" ]; then
+    report_warning "deleted $removed of $count file(s)"
+    report_verdict failed 1 "removed=$removed of=$count"
+  fi
+  report_success "deleted $count file(s)"
+  report_verdict cleaned 0 "removed=$count"
+}
+
+# ---------------------------------------------------------------- main
+
+su_load_config() {
+  local dir base
+  [ -n "$SU_CONFIG" ] || SU_CONFIG=./stack.conf
+  if [ ! -f "$SU_CONFIG" ]; then
+    printf 'stack-up: no config file at %s; pass --config FILE\n' "$SU_CONFIG" >&2
+    exit 2
+  fi
+  # A byte-order mark hides the [stack] header, so every [stack] key would
+  # read as a line outside any section.
+  if [ "$(LC_ALL=C head -c 3 < "$SU_CONFIG" 2>/dev/null | od -An -tx1 | LC_ALL=C tr -d ' \n')" = efbbbf ]; then
+    printf 'stack-up: %s starts with a UTF-8 byte-order mark; save it without one\n' "$SU_CONFIG" >&2
+    exit 2
+  fi
+  dir=$(cd -- "$(dirname -- "$SU_CONFIG")" && pwd -P) || exit 2
+  base=${SU_CONFIG##*/}
+  SU_CONFIG_ABS=$dir/$base
+  su_declare_schema
+  conf_load "$SU_CONFIG_ABS"
+  case $? in
+    0) su_check_shapes ;;
+    2) exit 2 ;;
+    *)
+      printf 'stack-up: the config has %s error(s); nothing was started\n' "$CONF_ERROR_COUNT" >&2
+      exit 2
+      ;;
+  esac
+  STACK_ROOT=$dir
+  STACK_STATE=$dir
+  PORT=1
+  su_load_model
+  unset PORT
+  if [ "$CONF_ERROR_COUNT" -gt 0 ]; then
+    printf 'stack-up: the config has %s error(s); nothing was started\n' "$CONF_ERROR_COUNT" >&2
+    exit 2
+  fi
+}
+
+# The command a person can paste to reach this same engine: the bare name
+# only when PATH already leads to this file, otherwise its full path.
+su_self_command() {
+  local found
+  found=$(command -v stack-up 2>/dev/null)
+  if [ -n "$found" ] && [ "$found" -ef "$SU_ENGINE_FILE" ]; then
+    SU_SELF=stack-up
+  else
+    SU_SELF=$(su_quote "$SU_ENGINE_FILE")
+  fi
+}
+
+# bash 3.2 writes every here-document and here-string to a temporary file in
+# /var/tmp, then /tmp, then /usr/tmp, whichever it can write first, and
+# ignores TMPDIR; it never falls back to the current folder.
+# Where it cannot, each one reads as empty: the flag table and the schema
+# would be nothing, and every config key "unknown".
+su_heredoc_ok() {
+  local probe=""
+  read -r probe <<EOF
+ok
+EOF
+  [ "$probe" = ok ]
+}
+
+main() {
+  if ! su_heredoc_ok; then
+    printf 'stack-up: bash cannot create a temporary file for a here-document (bash 3.2 uses /var/tmp, then /tmp, then /usr/tmp, and ignores TMPDIR); nothing was read or started\n' >&2
+    exit 2
+  fi
+  su_self_command
+  su_parse_args "$@"
+  if [ "$SU_MODE" = print-schema ]; then
+    su_print_schema
+    exit 0
+  fi
+  # Every other mode would ignore these flags, and a name in them would never
+  # be checked against the config.
+  case $SU_MODE in
+    up|plan) ;;
+    *)
+      if [ "$SU_SELECT_GIVEN" = 1 ] || [ -n "${SU_WITH// /}" ] || [ -n "${SU_WITHOUT// /}" ]; then
+        su_usage_error "--select, --with and --without apply only to a start and --plan"
+      fi
+      ;;
+  esac
+  su_load_config
+  su_resolve_paths
+  case $SU_MODE in
+    print-config) conf_rows; exit 0 ;;
+    print-paths) su_mode_print_paths ;;
+    plan) su_mode_plan ;;
+    check) su_mode_check ;;
+    stop) su_mode_stop ;;
+    clean) su_mode_clean ;;
+    up)
+      su_check_cli_against_config
+      su_mode_up
+      ;;
+  esac
+}
+
+# Flags that name config things are checked before any file is written, so a
+# typo exits 2 instead of starting a different stack.
+su_check_cli_against_config() {
+  local word
+  if [ "$SU_SELECT_GIVEN" = 1 ]; then
+    su_pickable
+    su_resolve_spec "$SU_SELECT" "$SU_PICKABLE" || su_usage_error "--select: \"$SU_BAD_TOKEN\" matches no pickable entry ($SU_PICKABLE)"
+  fi
+  for word in $SU_WITH $SU_WITHOUT; do
+    su_option_index "$word" || su_usage_error "--with/--without names $word, which is not an [option] in the config"
+  done
+  for word in $SU_WITH; do
+    util_contains_word "$word" "$SU_WITHOUT" && su_usage_error "--with $word and --without $word cannot both be given"
+  done
+  return 0
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

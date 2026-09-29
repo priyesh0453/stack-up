@@ -1,0 +1,137 @@
+stack-up 0.1.0 sample output, captured from a real run of the demo stack.
+
+Produced by the five README Quickstart commands, run as written from the
+repository folder, one after another:
+
+  bin/stack-up --config examples/demo/stack.conf --plan
+  bin/stack-up --config examples/demo/stack.conf --yes
+  curl -s http://127.0.0.1:18081/
+  curl -s http://127.0.0.1:18082/
+  bin/stack-up --config examples/demo/stack.conf --stop
+
+This is the demo environment, not a real project: the stack is examples/demo
+(small services on 127.0.0.1 built from bash and nc), run on macOS with the
+stock /bin/bash 3.2, with a fresh, empty home folder and the repository at
+~/stack-up, under a test sandbox that blocks system tools and limits where
+files may be written. The home folder is shown as ~; nothing else was
+changed. All five commands exited with status 0 and wrote nothing to
+standard error.
+
+$ bin/stack-up --config examples/demo/stack.conf --plan
+
+  DEMO STACK
+  hello-api . docs-site . ticker
+
+  Plan (nothing runs and no file is written)
+    config     ~/stack-up/examples/demo/stack.conf
+    root       ~/stack-up/examples/demo
+    state      ~/.local/state/stack-up/demo
+    option     ticker: off (default)
+    selected   hello-api docs-site ticker (default_select (recommended))
+    added      settings-seed because hello-api needs it
+    off        ticker: off (option ticker)
+    not selected: legacy-worker
+    requires   nc curl lsof pgrep
+
+  1/2  prepare
+    job settings-seed
+      run      mkdir -p "$STACK_STATE" && printf 'COLOR=green\n' >> "$STACK_STATE/demo-settings.env"
+      run_if   test ! -f "$STACK_STATE/demo-settings.env"
+      dir      ~/stack-up/examples/demo
+      deadline 10s
+      on_fail  abort
+    check greeting (required, for hello-api)
+      probe    grep -q '^GREETING=' "$STACK_STATE/demo-settings.env"
+      repair   bash add-greeting.sh "$STACK_STATE/demo-settings.env"
+      backup   copy of ~/.local/state/stack-up/demo/demo-settings.env, taken first
+
+  2/2  services
+    service hello-api  :18081
+      start    exec bash hello-api.sh
+      dir      ~/stack-up/examples/demo
+      ready    http http://127.0.0.1:18081/health 200 within 10s
+      env_file ${STACK_STATE}/demo-settings.env
+      after    settings-seed
+      on_fail  count
+    service docs-site  :18082
+      start    exec bash docs-site.sh
+      dir      ~/stack-up/examples/demo
+      ready    port within 15s
+      on_fail  count
+
+  smoke        http://127.0.0.1:18081/health must answer 200 within 20s
+
+
+$ bin/stack-up --config examples/demo/stack.conf --yes
+
+  DEMO STACK
+  hello-api . docs-site . ticker
+  Run log  ~/.local/state/stack-up/demo/logs/run-20260930-015019-80895.log
+
+  Configuration
+    .  option ticker: off (default)
+
+  Selection
+    .  selected by default_select (recommended): hello-api docs-site ticker
+    .  added settings-seed because hello-api needs it
+
+  Plan
+    .  prepare: 1 selected (settings-seed)
+    .  services: 3 selected (hello-api docs-site ticker)
+    -  ticker: off (option ticker)
+
+  Preflight
+    +  commands, files, folders and ports are ready
+
+  1/2  prepare
+    +  job settings-seed finished (0s)
+    .  check greeting: missing, repairing
+    +  check greeting: repaired and re-verified (original kept at ~/.local/state/stack-up/demo/backups/greeting-1790713220.bak)
+
+  2/2  services
+    +  hello-api ready :18081 (0s)
+    +  docs-site ready :18082 (0s)
+    -  ticker: off (option ticker)
+
+  Verification
+    +  smoke check: http://127.0.0.1:18081/health answered 200 (0s)
+
+  Summary
+    .  prepare: 1 ok
+    .  services: 2 ok, 1 skipped or off
+    .  checks: greeting=repaired
+    .  hello-api is at http://127.0.0.1:18081/
+    .  docs-site is at http://127.0.0.1:18082/
+    .  total time 3s
+
+  Open http://127.0.0.1:18081/health
+  Stop it with  ~/stack-up/bin/stack-up --config ~/stack-up/examples/demo/stack.conf --stop
+  Run log       ~/.local/state/stack-up/demo/logs/run-20260930-015019-80895.log
+
+
+$ curl -s http://127.0.0.1:18081/
+hello from the demo stack
+
+$ curl -s http://127.0.0.1:18082/
+<!doctype html>
+<html lang="en">
+<head><meta charset="us-ascii"><title>stack-up demo</title></head>
+<body>
+<h1>docs-site is up</h1>
+<p>This page is served by docs-site.sh, a few lines of bash around nc.</p>
+</body>
+</html>
+
+$ bin/stack-up --config examples/demo/stack.conf --stop
+
+  DEMO STACK
+  hello-api . docs-site . ticker
+  Run log  ~/.local/state/stack-up/demo/logs/run-20260930-015023-82249.log
+
+  Stop
+    +  stopped docs-site (process group 81987)
+    +  stopped hello-api (process group 81777)
+
+  Verification
+    +  Everything this stack recorded is down. Safe to power off the machine.
+

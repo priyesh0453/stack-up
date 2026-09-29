@@ -1,0 +1,2 @@
+worker 1 started
+panic: runtime error: index out of range

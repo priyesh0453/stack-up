@@ -1,0 +1,8 @@
+# static-docs.rules - deny rules for the documentation, applied by
+# unit-static.sh: no destroy recipe that reaches past the compose project, and
+# no pattern kill offered as advice.
+deny down-volumes down[[:space:]]+(-v|--volumes)
+deny volume-rm volume[[:space:]]+rm
+allow volume-rm --filter[[:space:]]+label=com\.docker\.compose\.project=
+deny pattern-kill (^|[;&|(`[:space:]])(pkill|killall)[[:space:]]+-
+deny prune (system|volume|container|image)[[:space:]]+prune

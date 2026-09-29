@@ -1,0 +1,23 @@
+# static.rules - deny rules for the shipped shell code (bin/, install.sh,
+# uninstall.sh, the demo scripts). Lines are normalized first: whole-line
+# comments blanked, /bin/, /sbin/, /usr/bin/ and /usr/sbin/ prefixes stripped,
+# and leading keywords such as if, !, command and exec removed.
+# unit-static.sh applies every rule to install.sh, uninstall.sh and the demo
+# scripts, and every rule but kill and dynamic-export to the whole engine. In
+# the engine, kill is allowed only inside su_alive, su_signal_group and
+# su_signal_launch, and dynamic-export only inside su_exec_child,
+# su_export_provider and su_export_env_file.
+deny pattern-kill (^|[;&|(`[:space:]])\\?(pkill|killall)([[:space:]]|$)
+deny kill (^|[;&|(`[:space:]])\\?kill([[:space:]]|$)
+deny parent-pid ([Pp][Pp][Ii][Dd]|getppid)
+deny ps-lookup (^|[;&|(`[:space:]])\\?ps([[:space:]]|$)
+allow ps-lookup su_compose_args[[:space:]]+ps[[:space:]]
+deny eval (^|[;&|(`[:space:]])eval([[:space:]]|$)
+deny sudo (^|[;&|(`[:space:]])sudo([[:space:]]|$)
+deny open-app (^|[;&|(`[:space:]])open[[:space:]]+-a
+deny system-tools (^|[;&|(`[:space:]])(osascript|launchctl|softwareupdate|pmset|shutdown|reboot|killall)([[:space:]]|$)
+deny down-volumes down[[:space:]]+(-v|--volumes)
+deny volume-rm volume[[:space:]]+rm
+allow volume-rm --filter[[:space:]]+label=com\.docker\.compose\.project=
+deny machine-paths (/opt/|/Applications|/usr/local/|/Library/|/home/)
+deny dynamic-export (^|[;&|(`[:space:]])(export|declare[[:space:]]+-[[:alpha:]]*x[[:alpha:]]*|typeset[[:space:]]+-[[:alpha:]]*x[[:alpha:]]*)([[:space:]]+-[-[:alpha:]]*)*[[:space:]]+("|\$)

@@ -1,0 +1,2 @@
+# .env holds this machine's secrets; it is made by hand from .env.example.
+.env

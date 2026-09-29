@@ -1,0 +1,45 @@
+# The database for examples/web-and-db. The [compose db] entry in stack.conf
+# starts it with docker compose -p web-and-db -f compose.yaml up -d db and
+# stops it with stop, never down, so the volume below keeps the data between
+# runs. The ${...} values come from .env in this folder, which compose reads
+# on its own; nothing from .env reaches the container unless it is named
+# under environment.
+services:
+  db:
+    # The official image ships healthcheck.sh, used below. lts follows the
+    # long-term support line; pin a full version when every machine must run
+    # the same build.
+    image: mariadb:lts
+    # :? stops compose with the message when the value is missing, so a
+    # forgotten .env fails here with a plain sentence instead of a database
+    # that starts with no password; :- gives a default for the rest.
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?put DB_ROOT_PASSWORD in .env}
+      MARIADB_DATABASE: ${DB_NAME:-app}
+      MARIADB_USER: ${DB_USER:-app}
+      MARIADB_PASSWORD: ${DB_PASSWORD:?put DB_PASSWORD in .env}
+    # Bound to 127.0.0.1, so the database is reachable from this machine and
+    # nowhere else. The host port is the one .env names; the container's is
+    # the image's default.
+    ports:
+      - "127.0.0.1:${DB_PORT:-3306}:3306"
+    # A named volume keeps the data across stops and restarts. stack-up never
+    # removes it; --print-paths prints the commands that would, for you to
+    # run by hand.
+    volumes:
+      - db-data:/var/lib/mysql
+    # The [compose db] entry waits for healthy, so this check is what "the
+    # database is up" means: the server accepts connections and its storage
+    # engine has finished starting, which a plain running state does not
+    # promise. start_period gives a first start time to initialise before
+    # failures count. The numbers are the ones the image's documentation
+    # uses.
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  db-data:
